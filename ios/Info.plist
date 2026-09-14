@@ -1,0 +1,76 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleDisplayName</key>
+	<string>Dead Lock</string>
+	<key>CFBundleExecutable</key>
+	<string>$(EXECUTABLE_NAME)</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.example.workoutapp</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>$(PRODUCT_NAME)</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>1.0.0</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>LSRequiresIPhoneOS</key>
+	<true/>
+	
+	<!-- Google OAuth URL Schemes (REVERSED_CLIENT_ID from GoogleService-Info.plist) -->
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleTypeRole</key>
+			<string>Editor</string>
+			<key>CFBundleURLName</key>
+			<string>Google OAuth Callback</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<!-- Extracted REVERSED_CLIENT_ID from ios/GoogleService-Info.plist -->
+				<string>com.googleusercontent.apps.646212023629-urciv20i6p3sas908ff5le4bsfcft8hm</string>
+				<!-- Custom App Deep Link Scheme -->
+				<string>deadlock</string>
+			</array>
+		</dict>
+	</array>
+
+	<!-- Privacy Permissions for Computer Vision & Nutrition Photos -->
+	<key>NSCameraUsageDescription</key>
+	<string>Dead Lock requires camera access for real-time exercise pose tracking and nutrition food scanning.</string>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>Dead Lock requires access to your photo library to log meals from saved images.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Dead Lock may access the microphone for audio cues during workout sets.</string>
+
+	<!-- Networking & WebView configuration -->
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsArbitraryLoads</key>
+		<true/>
+	</dict>
+
+	<key>UILaunchStoryboardName</key>
+	<string>LaunchScreen</string>
+	<key>UIRequiredDeviceCapabilities</key>
+	<array>
+		<string>armv7</string>
+	</array>
+	<key>UIStatusBarHidden</key>
+	<false/>
+	<key>UIStatusBarStyle</key>
+	<string>UIStatusBarStyleLightContent</string>
+	<key>UISupportedInterfaceOrientations</key>
+	<array>
+		<string>UIInterfaceOrientationPortrait</string>
+	</array>
+	<key>UIViewControllerBasedStatusBarAppearance</key>
+	<false/>
+</dict>
+</plist>

@@ -1,0 +1,63 @@
+name: Build iOS Runner Package (.ipa)
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+    inputs:
+      configuration:
+        description: 'Build Configuration (Release or Debug)'
+        required: true
+        default: 'Release'
+
+jobs:
+  build-ios:
+    runs-on: macos-14
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Build Web Application Bundle
+        run: |
+          npx esbuild app.jsx --outfile=app.js
+
+      - name: Prepare Web Assets for iOS Bundle
+        run: |
+          mkdir -p ios/App/www
+          cp index.html config.js app.js manifest.json icon.svg sw.js ios/App/www/
+          cp -r vendor ios/App/www/
+
+      - name: Install CocoaPods Dependencies
+        working-directory: ios
+        run: |
+          pod install --repo-update
+
+      - name: Build iOS Archive
+        working-directory: ios
+        run: |
+          xcodebuild -workspace DeadLock.xcworkspace \
+            -scheme DeadLock \
+            -configuration ${{ github.event.inputs.configuration || 'Release' }} \
+            -destination 'generic/platform=iOS' \
+            -archivePath build/DeadLock.xcarchive \
+            CODE_SIGNING_ALLOWED=NO \
+            archive
+
+      - name: Export Payload to .ipa Package
+        working-directory: ios
+        run: |
+          mkdir -p build/Payload
+          cp -r build/DeadLock.xcarchive/Products/Applications/DeadLock.app build/Payload/
+          cd build && zip -r DeadLock.ipa Payload/
+
+      - name: Upload .ipa Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DeadLock-iOS-Package
+          path: ios/build/DeadLock.ipa

@@ -1,0 +1,36 @@
+﻿# Dependencies
+node_modules/
+vendor/bundle/
+Pods/
+
+# Environment and Secret Files
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+*.p12
+
+# Google / Firebase Credentials
+google-services.json
+GoogleService-Info.plist
+ios/GoogleService-Info.plist
+android/app/google-services.json
+exportOptions.plist
+ios/exportOptions.plist
+
+# Production Builds and Temporary Outputs
+build/
+dist/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.DS_Store
+Thumbs.db
+
+# IDE and Editor configs
+.idea/
+.vscode/
+*.swp
+*.swo

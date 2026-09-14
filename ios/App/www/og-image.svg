@@ -1,0 +1,45 @@
+﻿<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630" fill="none">
+  <rect width="1200" height="630" fill="#000000"/>
+  <circle cx="200" cy="150" r="300" fill="#3478F7" fill-opacity="0.15" filter="blur(80px)"/>
+  <circle cx="1000" cy="500" r="280" fill="#EC562E" fill-opacity="0.15" filter="blur(80px)"/>
+  <rect x="80" y="80" width="1040" height="470" rx="32" fill="#101014" stroke="#26262B" stroke-width="2"/>
+  
+  <g transform="translate(140, 140)">
+    <!-- Lock Icon Badge -->
+    <rect width="80" height="80" rx="24" fill="#16161A" stroke="#383840" stroke-width="2"/>
+    <path d="M28 38V28a12 12 0 0 1 24 0v10" stroke="#3478F7" stroke-width="4" stroke-linecap="round"/>
+    <rect x="20" y="38" width="40" height="28" rx="8" fill="#3478F7"/>
+    <circle cx="40" cy="52" r="3" fill="#000000"/>
+    
+    <!-- Wordmark & Tagline -->
+    <text x="110" y="58" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="900" font-size="44" fill="#FFFFFF" letter-spacing="-1">DEAD // LOCK</text>
+    <text x="110" y="90" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="800" font-size="16" fill="#3478F7" letter-spacing="3">ELITE TRAINING &amp; NUTRITION ENGINE</text>
+  </g>
+
+  <!-- Feature Grid Pill -->
+  <g transform="translate(140, 310)">
+    <rect width="210" height="110" rx="20" fill="#16161A" stroke="#26262B" stroke-width="1.5"/>
+    <text x="24" y="44" font-family="sans-serif" font-size="13" font-weight="800" fill="#3478F7" letter-spacing="1">MACRO ENGINE</text>
+    <text x="24" y="74" font-family="sans-serif" font-size="15" font-weight="600" fill="#E4E4E7">Mifflin-St Jeor Formula</text>
+  </g>
+
+  <g transform="translate(370, 310)">
+    <rect width="210" height="110" rx="20" fill="#16161A" stroke="#26262B" stroke-width="1.5"/>
+    <text x="24" y="44" font-family="sans-serif" font-size="13" font-weight="800" fill="#EC562E" letter-spacing="1">6-DAY SPLIT</text>
+    <text x="24" y="74" font-family="sans-serif" font-size="15" font-weight="600" fill="#E4E4E7">Equipment-Aware Engine</text>
+  </g>
+
+  <g transform="translate(600, 310)">
+    <rect width="210" height="110" rx="20" fill="#16161A" stroke="#26262B" stroke-width="1.5"/>
+    <text x="24" y="44" font-family="sans-serif" font-size="13" font-weight="800" fill="#F3D2C6" letter-spacing="1">VISION AI</text>
+    <text x="24" y="74" font-family="sans-serif" font-size="15" font-weight="600" fill="#E4E4E7">Pose Form &amp; Auto-Reps</text>
+  </g>
+
+  <g transform="translate(830, 310)">
+    <rect width="210" height="110" rx="20" fill="#16161A" stroke="#26262B" stroke-width="1.5"/>
+    <text x="24" y="44" font-family="sans-serif" font-size="13" font-weight="800" fill="#10B981" letter-spacing="1">LOCAL FIRST</text>
+    <text x="24" y="74" font-family="sans-serif" font-size="15" font-weight="600" fill="#E4E4E7">Private &amp; Offline Ready</text>
+  </g>
+
+  <text x="140" y="490" font-family="sans-serif" font-size="14" font-weight="600" fill="#71717A">deadlockapp.com &bull; Cross-Platform PWA, iOS &amp; Android</text>
+</svg>

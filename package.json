@@ -1,0 +1,23 @@
+﻿{
+  "name": "dead-lock-workout-app",
+  "version": "1.0.0",
+  "description": "Dead Lock — Elite Cross-Platform Workout & Nutrition Engine",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "build": "npx esbuild app.jsx --outfile=app.js",
+    "build:min": "npx esbuild app.jsx --outfile=app.js --minify",
+    "test:security": "node scripts/security-audit.js"
+  },
+  "keywords": [
+    "fitness",
+    "workout",
+    "nutrition",
+    "macro",
+    "pwa",
+    "mediapipe",
+    "computer-vision"
+  ],
+  "author": "Dead Lock Labs",
+  "license": "MIT"
+}

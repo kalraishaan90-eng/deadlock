@@ -1,0 +1,46 @@
+﻿<!DOCTYPE html>
+<html lang="en" class="h-full bg-black text-white antialiased">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <title>404 — Page Not Found | Dead Lock</title>
+  <link rel="icon" type="image/svg+xml" href="./icon.svg">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Anton&family=Archivo+Black&family=Inter:wght@400;600;800;900&display=swap" rel="stylesheet">
+  <script src="./vendor/tailwind.min.js"></script>
+  <script>window.tailwind || document.write('<script src="https://cdn.tailwindcss.com"><\/script>');</script>
+</head>
+<body class="h-full bg-black text-zinc-100 flex flex-col items-center justify-center p-6 text-center select-none">
+  <div class="relative max-w-md w-full mx-auto space-y-6">
+    <!-- Ambient Glow -->
+    <div class="absolute -top-20 left-1/2 -translate-x-1/2 w-64 h-64 bg-[#EC562E]/15 rounded-full blur-3xl pointer-events-none"></div>
+
+    <!-- Lock Icon -->
+    <div class="w-20 h-20 mx-auto rounded-3xl bg-[#101014] border border-zinc-800 flex items-center justify-center shadow-2xl shadow-[#EC562E]/20">
+      <svg class="w-10 h-10 text-[#EC562E]" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+        <circle cx="12" cy="12" r="10"></circle>
+        <line x1="15" y1="9" x2="9" y2="15"></line>
+        <line x1="9" y1="9" x2="15" y2="15"></line>
+      </svg>
+    </div>
+
+    <div>
+      <h1 class="text-7xl font-black text-white tracking-tighter font-['Archivo_Black',sans-serif]">404</h1>
+      <p class="text-xs font-black tracking-[0.25em] text-[#EC562E] uppercase mt-2">OUT OF BOUNDS</p>
+      <p class="text-sm text-zinc-400 mt-3 max-w-xs mx-auto leading-relaxed">
+        The routine or page you're searching for does not exist or has been relocated.
+      </p>
+    </div>
+
+    <div class="pt-4 space-y-3">
+      <a href="/" class="w-full inline-flex items-center justify-center py-4 px-6 rounded-2xl bg-[#3478F7] hover:bg-blue-600 active:scale-95 transition-all text-white font-extrabold text-sm shadow-xl shadow-[#3478F7]/30">
+        Return to Dead Lock Dashboard
+      </a>
+      <a href="/privacy.html" class="block text-xs text-zinc-500 hover:text-zinc-300 transition-colors">
+        Privacy Policy &bull; Terms of Service
+      </a>
+    </div>
+  </div>
+</body>
+</html>

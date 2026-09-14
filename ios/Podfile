@@ -1,0 +1,25 @@
+# CocoaPods configuration for Dead Lock iOS Runner
+platform :ios, '14.0'
+use_frameworks!
+
+target 'DeadLock' do
+  # Firebase iOS Core & Authentication
+  pod 'FirebaseCore'
+  pod 'FirebaseAuth'
+
+  # Google Sign-In iOS SDK
+  pod 'GoogleSignIn', '~> 7.1'
+
+  target 'DeadLockTests' do
+    inherit! :search_paths
+  end
+end
+
+post_install do |installer|
+  installer.pods_project.targets.each do |target|
+    target.build_configurations.each do |config|
+      config.build_settings['IPHONEOS_DEPLOYMENT_TARGET'] = '14.0'
+      config.build_settings['ENABLE_BITCODE'] = 'NO'
+    end
+  end
+end

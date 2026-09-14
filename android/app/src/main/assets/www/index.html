@@ -1,0 +1,220 @@
+<!DOCTYPE html>
+<html lang="en" class="h-full bg-black text-white antialiased selection:bg-[#3478F7]/30 selection:text-white">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+  <title>Dead Lock — Elite Training & Nutrition</title>
+  <meta name="description" content="Dead Lock is an elite equipment-aware training & nutrition engine featuring a 6-day split, computer vision auto rep counter, and macro calculator.">
+  <meta name="keywords" content="workout, bodybuilding, fitness tracker, macro calculator, gym split, rep counter, computer vision fitness">
+  <meta name="author" content="Dead Lock Labs">
+  <link rel="canonical" href="https://deadlockapp.com/">
+
+  <!-- Open Graph / Facebook -->
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="https://deadlockapp.com/">
+  <meta property="og:title" content="Dead Lock — Elite Training & Nutrition">
+  <meta property="og:description" content="Equipment-aware 6-day workout split, camera form check & auto rep counter, AI food logger, and macro engine.">
+  <meta property="og:image" content="https://deadlockapp.com/og-image.svg">
+  <meta property="og:site_name" content="Dead Lock">
+
+  <!-- Twitter -->
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:url" content="https://deadlockapp.com/">
+  <meta name="twitter:title" content="Dead Lock — Elite Training & Nutrition">
+  <meta name="twitter:description" content="Equipment-aware 6-day workout split, camera form check & auto rep counter, AI food logger, and macro engine.">
+  <meta name="twitter:image" content="https://deadlockapp.com/og-image.svg">
+  
+  <!-- PWA & Mobile Web App Meta -->
+  <link rel="manifest" href="./manifest.json">
+  <link rel="icon" type="image/svg+xml" href="./icon.svg">
+  <link rel="shortcut icon" href="./icon.svg">
+  <link rel="apple-touch-icon" href="./icon.svg">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="Dead Lock">
+  <meta name="theme-color" content="#000000">
+
+  <!-- Google Fonts: Archivo Black & Anton (Heavy condensed display font for intro wordmark) -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Anton&family=Archivo+Black&family=Inter:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
+
+  <!-- Tailwind CSS (Vendor with CDN fallback) -->
+  <script src="./vendor/tailwind.min.js"></script>
+  <script>window.tailwind || document.write('<script src="https://cdn.tailwindcss.com"><\/script>');</script>
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          colors: {
+            black: '#000000',
+            cobalt: '#3478F7',
+            tangerine: '#EC562E',
+            peach: '#F3D2C6',
+            surface: {
+              DEFAULT: '#101014',
+              subtle: '#16161A',
+              elevated: '#1D1D22',
+              border: '#26262B',
+              borderLight: '#383840'
+            }
+          },
+          fontFamily: {
+            display: ['"Archivo Black"', '"Anton"', 'sans-serif'],
+            sans: [
+              '-apple-system',
+              'BlinkMacSystemFont',
+              '"SF Pro Display"',
+              '"SF Pro Text"',
+              '"Inter"',
+              'system-ui',
+              'sans-serif'
+            ]
+          },
+          transitionTimingFunction: {
+            'spring': 'cubic-bezier(0.32, 0.72, 0, 1)'
+          }
+        }
+      }
+    }
+  </script>
+
+  <!-- Custom Spring Dynamics & Product UI Styling -->
+  <style>
+    :root {
+      --spring-ease: cubic-bezier(0.32, 0.72, 0, 1);
+      --safe-top: env(safe-area-inset-top, 0px);
+      --safe-bottom: env(safe-area-inset-bottom, 0px);
+      --safe-left: env(safe-area-inset-left, 0px);
+      --safe-right: env(safe-area-inset-right, 0px);
+    }
+
+    * {
+      -webkit-tap-highlight-color: transparent;
+      user-select: none;
+      box-sizing: border-box;
+    }
+
+    input, textarea, select {
+      user-select: text;
+    }
+
+    /* Spring-curve press feedback */
+    .tap-spring {
+      transition: transform 0.18s var(--spring-ease), opacity 0.18s var(--spring-ease);
+      will-change: transform;
+    }
+
+    .tap-spring:active {
+      transform: scale(0.96) !important;
+    }
+
+    /* Spring transitions between screens & tabs */
+    .screen-spring-enter {
+      animation: springEnter 0.35s var(--spring-ease) forwards;
+    }
+
+    @keyframes springEnter {
+      0% {
+        opacity: 0;
+        transform: translateY(12px) scale(0.985);
+      }
+      100% {
+        opacity: 1;
+        transform: translateY(0) scale(1);
+      }
+    }
+
+    /* Spring checkmark completion animation */
+    .check-spring {
+      animation: checkBounce 0.35s var(--spring-ease) forwards;
+    }
+
+    @keyframes checkBounce {
+      0% { transform: scale(0.6); opacity: 0; }
+      60% { transform: scale(1.15); opacity: 1; }
+      100% { transform: scale(1); opacity: 1; }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      .tap-spring, .tap-spring:active {
+        transform: none !important;
+        transition: none !important;
+      }
+      .screen-spring-enter, .check-spring {
+        animation: none !important;
+        opacity: 1 !important;
+        transform: none !important;
+      }
+    }
+
+    .no-scrollbar::-webkit-scrollbar {
+      display: none;
+    }
+    .no-scrollbar {
+      -ms-overflow-style: none;
+      scrollbar-width: none;
+    }
+
+    /* iOS safe area support for fixed elements */
+    .safe-top { padding-top: var(--safe-top); }
+    .safe-bottom { padding-bottom: var(--safe-bottom); }
+    .safe-inset { padding: var(--safe-top) var(--safe-right) var(--safe-bottom) var(--safe-left); }
+  </style>
+
+  <!-- Firebase App & Authentication SDK (Local vendor with CDN fallback) -->
+  <script src="./vendor/firebase-app-compat.js"></script>
+  <script>window.firebase || document.write('<script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-app-compat.js"><\/script>');</script>
+  <script src="./vendor/firebase-auth-compat.js"></script>
+  <script>(window.firebase && window.firebase.auth) || document.write('<script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-auth-compat.js"><\/script>');</script>
+
+  <!-- App Configuration & Service Credentials -->
+  <script src="./config.js"></script>
+  <script>
+    if (window.initFirebase) {
+      window.initFirebase();
+    }
+  </script>
+
+  <!-- React 18 (Local vendor with CDN fallback) -->
+  <script src="./vendor/react.min.js"></script>
+  <script>window.React || document.write('<script src="https://unpkg.com/react@18/umd/react.production.min.js"><\/script>');</script>
+  <script src="./vendor/react-dom.min.js"></script>
+  <script>window.ReactDOM || document.write('<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"><\/script>');</script>
+</head>
+<body class="h-full bg-black text-zinc-100 overflow-x-hidden antialiased">
+  <div id="root" class="h-full flex flex-col">
+    <!-- Immediate visual state while React mounts -->
+    <div class="flex-1 flex flex-col items-center justify-center p-8 space-y-4 text-center" style="padding-top: env(safe-area-inset-top, 0px);">
+      <div class="w-10 h-10 border-2 border-[#3478F7] border-t-transparent rounded-full animate-spin"></div>
+      <p class="text-sm font-semibold text-zinc-300">Launching Dead Lock...</p>
+    </div>
+  </div>
+
+  <script>
+    // Clean old caches & unregister service workers to avoid stale scripts
+    if ('serviceWorker' in navigator) {
+      navigator.serviceWorker.getRegistrations().then(function(registrations) {
+        for (let r of registrations) { r.unregister(); }
+      });
+    }
+    if ('caches' in window) {
+      caches.keys().then(function(keys) {
+        for (let k of keys) { caches.delete(k); }
+      });
+    }
+
+    window.addEventListener('error', function(e) {
+      console.error('Captured Error:', e);
+      const root = document.getElementById('root');
+      if (root && root.innerText.includes('Launching')) {
+        root.innerHTML = '<div style="padding:40px;color:#ff5555;font-family:sans-serif;text-align:center;"><h3>Initialization Error</h3><p style="color:#aaa;font-size:12px;">' + (e.message || 'Unknown error') + '</p><button onclick="localStorage.clear();location.reload()" style="margin-top:16px;padding:8px 16px;background:#3478F7;color:#fff;border:none;border-radius:8px;cursor:pointer;">Clear Cache & Reload</button></div>';
+      }
+    });
+  </script>
+
+  <!-- Dead Lock Application Bundle -->
+  <script src="./app.js?v=deadlock_prod_3"></script>
+</body>
+</html>
