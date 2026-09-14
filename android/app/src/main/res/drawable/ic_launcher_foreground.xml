@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <group
+        android:scaleX="0.14"
+        android:scaleY="0.14"
+        android:translateX="18.16"
+        android:translateY="18.16">
+        <!-- Shackle -->
+        <path
+            android:pathData="M176,240 V168 C176,124 212,88 256,88 C300,88 336,124 336,168 V240"
+            android:strokeColor="#3478F7"
+            android:strokeWidth="38"
+            android:strokeLineCap="round" />
+        <!-- Lock Body -->
+        <path
+            android:pathData="M168,230 L344,230 A32,32 0 0 1 376,262 L376,392 A32,32 0 0 1 344,424 L168,424 A32,32 0 0 1 136,392 L136,262 A32,32 0 0 1 168,230 Z"
+            android:fillColor="#14141a"
+            android:strokeColor="#3478F7"
+            android:strokeWidth="12" />
+        <!-- Slashes -->
+        <path
+            android:pathData="M228,285 L212,365"
+            android:strokeColor="#EC562E"
+            android:strokeWidth="14"
+            android:strokeLineCap="round" />
+        <path
+            android:pathData="M258,285 L242,365"
+            android:strokeColor="#EC562E"
+            android:strokeWidth="14"
+            android:strokeLineCap="round" />
+        <!-- Keyhole -->
+        <path
+            android:pathData="M295,301 A14,14 0 1 0 295,329 A14,14 0 1 0 295,301 Z"
+            android:fillColor="#F3D2C6" />
+        <path
+            android:pathData="M291,325 L287,355 L303,355 L299,325 Z"
+            android:fillColor="#F3D2C6" />
+    </group>
+</vector>

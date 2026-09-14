@@ -25,7 +25,7 @@ jobs:
 
       - name: Build Web Application Bundle
         run: |
-          npx esbuild app.jsx --outfile=app.js
+          npx --yes esbuild app.jsx --outfile=app.js
 
       - name: Prepare Web Assets for iOS Bundle
         run: |

@@ -1,4 +1,4 @@
-﻿package com.physique.workoutapp;
+package com.physique.workoutapp;
 
 import android.Manifest;
 import android.content.pm.PackageManager;
@@ -44,6 +44,11 @@ public class MainActivity extends AppCompatActivity {
         setContentView(webView);
 
         setupWebView();
+
+        BillingBridge billingBridge = new BillingBridge(this);
+        billingBridge.setWebView(webView);
+        webView.addJavascriptInterface(billingBridge, "DeadLockBilling");
+
         requestAppPermissions();
 
         webView.loadUrl("file:///android_asset/www/index.html");

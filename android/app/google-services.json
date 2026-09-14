@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "646212023629",
+    "project_id": "workkoutapp",
+    "storage_bucket": "workkoutapp.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:646212023629:android:c692059775553749c27304",
+        "android_client_info": {
+          "package_name": "com.physique.workoutapp"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyAVIoo3XSAsxZAjrWzERWU-UZqPSE4iQR0"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

@@ -23,7 +23,14 @@ function getStorageKeys(uid) {
     FOOD_LOG: `deadlock_${ns}_food_log`,
     WEIGHT_LOG: `deadlock_${ns}_weight_log`,
     API_KEY: `deadlock_${ns}_api_key`,
-    HAS_ONBOARDED: `deadlock_${ns}_has_onboarded`
+    HAS_ONBOARDED: `deadlock_${ns}_has_onboarded`,
+    IS_PRO: `deadlock_${ns}_is_pro`,
+    PRO_EXPIRY: `deadlock_${ns}_pro_expiry`,
+    SCAN_CREDITS: `deadlock_${ns}_scan_credits`,
+    CAMERA_USAGE: `deadlock_${ns}_camera_usage`,
+    AI_SCAN_USAGE: `deadlock_${ns}_ai_scan_usage`,
+    DIET_PREFERENCES: `deadlock_${ns}_diet_preferences`,
+    DIET_PLAN: `deadlock_${ns}_diet_plan`
   };
 }
 
@@ -314,6 +321,237 @@ async function clearAllPhotosFromDb() {
 }
 
 // ==========================================
+// 2.5 BILLING & ENTITLEMENT ENGINE
+// Platform billing abstraction + free-tier metering
+// ==========================================
+
+const FREE_TIER_LIMITS = {
+  CAMERA_SETS_PER_WEEK: 3,
+  AI_SCANS_PER_DAY: 3
+};
+
+// Platform billing bridge abstraction
+const BillingService = {
+  _platform: (() => {
+    const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) && !window.MSStream;
+    const isAndroid = /Android/.test(navigator.userAgent);
+    return isIOS ? 'ios' : isAndroid ? 'android' : 'web';
+  })(),
+
+  isAvailable() {
+    if (this._platform === 'android') return typeof window.DeadLockBilling !== 'undefined';
+    if (this._platform === 'ios') return !!(window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.DeadLockBilling);
+    return false;
+  },
+
+  _pendingCallbacks: {},
+
+  _postToNative(action, data) {
+    return new Promise((resolve, reject) => {
+      const callbackId = 'billing_' + Date.now() + '_' + Math.random().toString(36).slice(2);
+      this._pendingCallbacks[callbackId] = { resolve, reject };
+      const payload = { action, callbackId, ...data };
+
+      try {
+        if (this._platform === 'android' && window.DeadLockBilling) {
+          window.DeadLockBilling[action](JSON.stringify(payload));
+        } else if (this._platform === 'ios' && window.webkit?.messageHandlers?.DeadLockBilling) {
+          window.webkit.messageHandlers.DeadLockBilling.postMessage(payload);
+        } else {
+          reject(new Error('Billing not available on this platform'));
+        }
+      } catch (e) {
+        delete this._pendingCallbacks[callbackId];
+        reject(e);
+      }
+
+      // Timeout after 30s
+      setTimeout(() => {
+        if (this._pendingCallbacks[callbackId]) {
+          delete this._pendingCallbacks[callbackId];
+          reject(new Error('Billing request timed out'));
+        }
+      }, 30000);
+    });
+  },
+
+  async queryProducts() {
+    if (!this.isAvailable()) return [];
+    try {
+      const result = await this._postToNative('queryProducts', {});
+      return Array.isArray(result) ? result : [];
+    } catch (e) {
+      return [];
+    }
+  },
+
+  async purchase(sku) {
+    if (!this.isAvailable()) return { status: 'unavailable' };
+    try {
+      return await this._postToNative('purchase', { sku });
+    } catch (e) {
+      return { status: 'failed', error: e.message };
+    }
+  },
+
+  async restorePurchases() {
+    if (!this.isAvailable()) return { restored: false };
+    try {
+      return await this._postToNative('restorePurchases', {});
+    } catch (e) {
+      return { restored: false, error: e.message };
+    }
+  },
+
+  async checkActiveSubscription() {
+    if (!this.isAvailable()) return { active: false };
+    try {
+      return await this._postToNative('getActiveSubscription', {});
+    } catch (e) {
+      return { active: false };
+    }
+  }
+};
+
+// Global callback handler for native billing bridge responses
+window.__billingCallback = function(callbackId, status, data) {
+  const cb = BillingService._pendingCallbacks[callbackId];
+  if (cb) {
+    delete BillingService._pendingCallbacks[callbackId];
+    if (status === 'success') {
+      try { cb.resolve(typeof data === 'string' ? JSON.parse(data) : data); } catch (e) { cb.resolve(data); }
+    } else {
+      cb.reject(new Error(typeof data === 'string' ? data : 'Billing error'));
+    }
+  }
+};
+
+// Entitlement verification — checks platform billing on launch
+async function verifyProEntitlement(userKeys) {
+  // 1. Check native billing bridge
+  if (BillingService.isAvailable()) {
+    try {
+      const sub = await BillingService.checkActiveSubscription();
+      const isPro = sub && sub.active === true;
+      localStorage.setItem(userKeys.IS_PRO, isPro ? 'true' : 'false');
+      if (sub.expiresAt) {
+        localStorage.setItem(userKeys.PRO_EXPIRY, sub.expiresAt);
+      }
+      return { isPro, expiresAt: sub.expiresAt || null };
+    } catch (e) {
+      // Fallback to cached value
+    }
+  }
+  // 2. Fallback to cached local value
+  const cached = localStorage.getItem(userKeys.IS_PRO) === 'true';
+  const expiry = localStorage.getItem(userKeys.PRO_EXPIRY);
+  if (cached && expiry) {
+    const expiresAt = new Date(expiry);
+    if (expiresAt > new Date()) {
+      return { isPro: true, expiresAt: expiry };
+    }
+    // Expired — clear cache
+    localStorage.setItem(userKeys.IS_PRO, 'false');
+    localStorage.removeItem(userKeys.PRO_EXPIRY);
+  }
+  return { isPro: cached && !expiry, expiresAt: expiry || null };
+}
+
+// Camera tracking usage — rolling 7-day window
+function canUseCameraTracking(userKeys, isPro) {
+  if (isPro) return { allowed: true, used: 0, limit: Infinity };
+  try {
+    const raw = localStorage.getItem(userKeys.CAMERA_USAGE);
+    const usage = raw ? JSON.parse(raw) : [];
+    const sevenDaysAgo = Date.now() - 7 * 24 * 60 * 60 * 1000;
+    const recentUsage = usage.filter(ts => ts > sevenDaysAgo);
+    const used = recentUsage.length;
+    return {
+      allowed: used < FREE_TIER_LIMITS.CAMERA_SETS_PER_WEEK,
+      used,
+      limit: FREE_TIER_LIMITS.CAMERA_SETS_PER_WEEK,
+      remaining: Math.max(0, FREE_TIER_LIMITS.CAMERA_SETS_PER_WEEK - used)
+    };
+  } catch (e) {
+    return { allowed: true, used: 0, limit: FREE_TIER_LIMITS.CAMERA_SETS_PER_WEEK };
+  }
+}
+
+function recordCameraUsage(userKeys) {
+  try {
+    const raw = localStorage.getItem(userKeys.CAMERA_USAGE);
+    const usage = raw ? JSON.parse(raw) : [];
+    const sevenDaysAgo = Date.now() - 7 * 24 * 60 * 60 * 1000;
+    const cleaned = usage.filter(ts => ts > sevenDaysAgo);
+    cleaned.push(Date.now());
+    localStorage.setItem(userKeys.CAMERA_USAGE, JSON.stringify(cleaned));
+  } catch (e) {}
+}
+
+// AI scan usage — calendar day limit
+function canUseAiScan(userKeys, isPro) {
+  if (isPro) return { allowed: true, used: 0, limit: Infinity };
+  try {
+    const raw = localStorage.getItem(userKeys.AI_SCAN_USAGE);
+    const usage = raw ? JSON.parse(raw) : { date: '', count: 0 };
+    const today = new Date().toISOString().slice(0, 10);
+    if (usage.date !== today) {
+      return { allowed: true, used: 0, limit: FREE_TIER_LIMITS.AI_SCANS_PER_DAY, remaining: FREE_TIER_LIMITS.AI_SCANS_PER_DAY };
+    }
+    const used = usage.count || 0;
+    return {
+      allowed: used < FREE_TIER_LIMITS.AI_SCANS_PER_DAY,
+      used,
+      limit: FREE_TIER_LIMITS.AI_SCANS_PER_DAY,
+      remaining: Math.max(0, FREE_TIER_LIMITS.AI_SCANS_PER_DAY - used)
+    };
+  } catch (e) {
+    return { allowed: true, used: 0, limit: FREE_TIER_LIMITS.AI_SCANS_PER_DAY };
+  }
+}
+
+function recordAiScanUsage(userKeys) {
+  try {
+    const raw = localStorage.getItem(userKeys.AI_SCAN_USAGE);
+    const usage = raw ? JSON.parse(raw) : { date: '', count: 0 };
+    const today = new Date().toISOString().slice(0, 10);
+    if (usage.date !== today) {
+      localStorage.setItem(userKeys.AI_SCAN_USAGE, JSON.stringify({ date: today, count: 1 }));
+    } else {
+      localStorage.setItem(userKeys.AI_SCAN_USAGE, JSON.stringify({ date: today, count: (usage.count || 0) + 1 }));
+    }
+  } catch (e) {}
+}
+
+// Scan credit management (consumable packs)
+function getScanCredits(userKeys) {
+  try {
+    return parseInt(localStorage.getItem(userKeys.SCAN_CREDITS) || '0', 10);
+  } catch (e) {
+    return 0;
+  }
+}
+
+function addScanCredits(userKeys, amount) {
+  try {
+    const current = getScanCredits(userKeys);
+    localStorage.setItem(userKeys.SCAN_CREDITS, String(current + amount));
+    return current + amount;
+  } catch (e) {
+    return 0;
+  }
+}
+
+function useScanCredit(userKeys) {
+  const current = getScanCredits(userKeys);
+  if (current > 0) {
+    localStorage.setItem(userKeys.SCAN_CREDITS, String(current - 1));
+    return { used: true, remaining: current - 1 };
+  }
+  return { used: false, remaining: 0 };
+}
+
+// ==========================================
 // 3. MACRO CALCULATION ENGINE (Mifflin-St Jeor)
 // ==========================================
 function calculateMacros(profile) {
@@ -373,55 +611,166 @@ function calculateMacros(profile) {
 // Offline-first calculation for immediate macro feedback
 // ==========================================
 const NUTRITION_DATABASE = [
-  // Breads & Grains
-  { keys: ['white bread', 'slice of bread', 'bread slice', 'bread', 'toast', 'breads'], name: 'White Bread', unit: 'slice (30g)', cal: 75, p: 2.5, c: 14.0, f: 1.0 },
-  { keys: ['brown bread', 'whole wheat bread', 'multigrain bread'], name: 'Whole Wheat Bread', unit: 'slice (32g)', cal: 72, p: 3.2, c: 13.0, f: 1.1 },
-  { keys: ['roti', 'chapati', 'phulka', 'rotis', 'chapatis'], name: 'Roti / Chapati', unit: 'piece (40g)', cal: 105, p: 3.2, c: 20.0, f: 1.2 },
-  { keys: ['paratha', 'parathas'], name: 'Paratha', unit: 'piece (65g)', cal: 240, p: 4.5, c: 31.0, f: 11.0 },
-  { keys: ['naan', 'butter naan'], name: 'Naan', unit: 'piece (90g)', cal: 260, p: 7.5, c: 45.0, f: 5.5 },
-  { keys: ['rice', 'white rice', 'cooked rice', 'steamed rice', 'chawal'], name: 'White Rice (cooked)', unit: '1 bowl (150g)', cal: 195, p: 4.1, c: 42.0, f: 0.4 },
-  { keys: ['brown rice'], name: 'Brown Rice (cooked)', unit: '1 bowl (150g)', cal: 170, p: 4.0, c: 35.0, f: 1.5 },
-  { keys: ['pasta', 'cooked pasta', 'spaghetti', 'macaroni'], name: 'Pasta (cooked)', unit: '1 cup (140g)', cal: 185, p: 7.0, c: 38.0, f: 1.1 },
-  { keys: ['oats', 'oatmeal', 'rolled oats'], name: 'Oats / Oatmeal', unit: 'serving (40g dry)', cal: 152, p: 5.3, c: 27.0, f: 2.8 },
-  { keys: ['quinoa'], name: 'Quinoa (cooked)', unit: '1 cup (185g)', cal: 222, p: 8.1, c: 39.0, f: 3.6 },
-  
-  // Proteins & Meats
-  { keys: ['chicken breast', 'grilled chicken breast', 'boiled chicken breast'], name: 'Chicken Breast (skinless)', unit: '100g cooked', cal: 165, p: 31.0, c: 0, f: 3.6, perGram: 100 },
-  { keys: ['chicken', 'chicken curry', 'cooked chicken'], name: 'Chicken', unit: '100g cooked', cal: 215, p: 24.0, c: 1.0, f: 12.0, perGram: 100 },
-  { keys: ['egg white', 'boiled egg white', 'egg whites'], name: 'Egg White', unit: '1 large (33g)', cal: 17, p: 3.6, c: 0.2, f: 0.1 },
-  { keys: ['egg', 'boiled egg', 'large egg', 'whole egg', 'eggs'], name: 'Whole Egg', unit: '1 large (50g)', cal: 72, p: 6.3, c: 0.4, f: 4.8 },
-  { keys: ['omelet', 'omelette', 'scrambled eggs', 'scrambled egg'], name: 'Omelet (2 eggs)', unit: '2 eggs (100g)', cal: 180, p: 13.0, c: 1.2, f: 14.0 },
-  { keys: ['salmon', 'grilled salmon'], name: 'Salmon', unit: '100g cooked', cal: 208, p: 20.4, c: 0, f: 13.4, perGram: 100 },
-  { keys: ['tuna', 'canned tuna'], name: 'Tuna (canned in water)', unit: '1 can (120g drained)', cal: 130, p: 29.0, c: 0, f: 1.0 },
-  { keys: ['beef', 'ground beef', 'steak', 'lean beef'], name: 'Lean Beef', unit: '100g cooked', cal: 215, p: 26.0, c: 0, f: 11.5, perGram: 100 },
-  { keys: ['whey protein', 'whey', 'protein powder', 'protein shake', 'protein scoop'], name: 'Whey Protein', unit: '1 scoop (30g)', cal: 120, p: 24.0, c: 3.0, f: 1.5 },
-  
-  // Dairy & Plant Proteins
-  { keys: ['paneer', 'cottage cheese'], name: 'Paneer', unit: '100g', cal: 265, p: 18.0, c: 4.0, f: 20.0, perGram: 100 },
-  { keys: ['tofu', 'firm tofu'], name: 'Tofu', unit: '100g', cal: 83, p: 8.8, c: 1.9, f: 4.8, perGram: 100 },
-  { keys: ['milk', 'whole milk', 'full cream milk', 'cow milk'], name: 'Whole Milk', unit: '1 cup (240ml)', cal: 150, p: 8.0, c: 12.0, f: 8.0 },
-  { keys: ['skim milk', 'low fat milk', 'skimmed milk'], name: 'Low-Fat Milk', unit: '1 cup (240ml)', cal: 90, p: 8.5, c: 12.5, f: 0.2 },
-  { keys: ['curd', 'yogurt', 'dahi'], name: 'Curd / Yogurt', unit: '1 bowl (150g)', cal: 92, p: 5.3, c: 7.0, f: 5.0 },
-  { keys: ['greek yogurt', 'plain greek yogurt'], name: 'Greek Yogurt (non-fat)', unit: '1 cup (150g)', cal: 90, p: 15.0, c: 5.0, f: 0.5 },
-  { keys: ['dal', 'lentil', 'lentil soup', 'yellow dal', 'moong dal', 'toor dal', 'daal'], name: 'Dal (cooked lentils)', unit: '1 bowl (150g)', cal: 150, p: 9.0, c: 20.0, f: 3.5 },
-  { keys: ['chickpeas', 'chana', 'chole'], name: 'Cooked Chickpeas', unit: '1 bowl (150g)', cal: 240, p: 12.0, c: 40.0, f: 4.0 },
-  { keys: ['kidney beans', 'rajma'], name: 'Kidney Beans / Rajma', unit: '1 bowl (150g)', cal: 215, p: 13.0, c: 38.0, f: 1.0 },
+  // ===== BREADS & GRAINS =====
+  { keys: ['white bread', 'slice of bread', 'bread slice', 'bread', 'toast', 'breads'], name: 'White Bread', unit: 'slice (30g)', cal: 75, p: 2.5, c: 14.0, f: 1.0, category: 'grain', dietType: 'veg' },
+  { keys: ['brown bread', 'whole wheat bread', 'multigrain bread'], name: 'Whole Wheat Bread', unit: 'slice (32g)', cal: 72, p: 3.2, c: 13.0, f: 1.1, category: 'grain', dietType: 'veg' },
+  { keys: ['roti', 'chapati', 'phulka', 'rotis', 'chapatis'], name: 'Roti / Chapati', unit: 'piece (40g)', cal: 105, p: 3.2, c: 20.0, f: 1.2, category: 'grain', dietType: 'veg' },
+  { keys: ['paratha', 'parathas', 'aloo paratha'], name: 'Paratha', unit: 'piece (65g)', cal: 240, p: 4.5, c: 31.0, f: 11.0, category: 'grain', dietType: 'veg' },
+  { keys: ['naan', 'butter naan', 'garlic naan'], name: 'Naan', unit: 'piece (90g)', cal: 260, p: 7.5, c: 45.0, f: 5.5, category: 'grain', dietType: 'veg' },
+  { keys: ['rice', 'white rice', 'cooked rice', 'steamed rice', 'chawal'], name: 'White Rice (cooked)', unit: '1 bowl (150g)', cal: 195, p: 4.1, c: 42.0, f: 0.4, category: 'grain', dietType: 'veg' },
+  { keys: ['brown rice'], name: 'Brown Rice (cooked)', unit: '1 bowl (150g)', cal: 170, p: 4.0, c: 35.0, f: 1.5, category: 'grain', dietType: 'veg' },
+  { keys: ['pasta', 'cooked pasta', 'spaghetti', 'macaroni', 'penne'], name: 'Pasta (cooked)', unit: '1 cup (140g)', cal: 185, p: 7.0, c: 38.0, f: 1.1, category: 'grain', dietType: 'veg' },
+  { keys: ['oats', 'oatmeal', 'rolled oats'], name: 'Oats / Oatmeal', unit: 'serving (40g dry)', cal: 152, p: 5.3, c: 27.0, f: 2.8, category: 'grain', dietType: 'veg' },
+  { keys: ['quinoa'], name: 'Quinoa (cooked)', unit: '1 cup (185g)', cal: 222, p: 8.1, c: 39.0, f: 3.6, category: 'grain', dietType: 'veg' },
+  { keys: ['ragi roti', 'ragi chapati', 'nachni roti'], name: 'Ragi Roti', unit: 'piece (45g)', cal: 110, p: 3.5, c: 22.0, f: 1.0, category: 'grain', dietType: 'veg' },
+  { keys: ['bajra roti', 'bajra chapati', 'pearl millet roti'], name: 'Bajra Roti', unit: 'piece (45g)', cal: 115, p: 3.0, c: 23.0, f: 1.2, category: 'grain', dietType: 'veg' },
+  { keys: ['jowar roti', 'jowar chapati', 'sorghum roti'], name: 'Jowar Roti', unit: 'piece (45g)', cal: 108, p: 3.2, c: 22.5, f: 0.8, category: 'grain', dietType: 'veg' },
+  { keys: ['makki roti', 'makki ki roti', 'corn roti'], name: 'Makki Roti', unit: 'piece (55g)', cal: 130, p: 2.8, c: 28.0, f: 1.5, category: 'grain', dietType: 'veg' },
+  { keys: ['couscous'], name: 'Couscous (cooked)', unit: '1 cup (160g)', cal: 176, p: 6.0, c: 36.0, f: 0.3, category: 'grain', dietType: 'veg' },
+  { keys: ['bulgur', 'bulgur wheat', 'dalia'], name: 'Bulgur Wheat (cooked)', unit: '1 cup (182g)', cal: 151, p: 5.6, c: 34.0, f: 0.4, category: 'grain', dietType: 'veg' },
+  { keys: ['whole wheat wrap', 'tortilla', 'wrap'], name: 'Whole Wheat Wrap', unit: '1 wrap (64g)', cal: 170, p: 5.5, c: 28.0, f: 4.5, category: 'grain', dietType: 'veg' },
+  { keys: ['bagel'], name: 'Plain Bagel', unit: '1 bagel (95g)', cal: 270, p: 10.0, c: 52.0, f: 1.5, category: 'grain', dietType: 'veg' },
+  { keys: ['english muffin'], name: 'English Muffin', unit: '1 muffin (57g)', cal: 132, p: 4.5, c: 26.0, f: 1.0, category: 'grain', dietType: 'veg' },
 
-  // Fruits & Vegetables
-  { keys: ['banana', 'ripe banana', 'bananas'], name: 'Banana', unit: '1 medium (118g)', cal: 105, p: 1.3, c: 27.0, f: 0.3 },
-  { keys: ['apple', 'apples'], name: 'Apple', unit: '1 medium (182g)', cal: 95, p: 0.5, c: 25.0, f: 0.3 },
-  { keys: ['orange', 'oranges'], name: 'Orange', unit: '1 medium (131g)', cal: 62, p: 1.2, c: 15.4, f: 0.2 },
-  { keys: ['potato', 'boiled potato', 'potatoes'], name: 'Potato (boiled)', unit: '1 medium (173g)', cal: 160, p: 4.3, c: 37.0, f: 0.2 },
-  { keys: ['sweet potato', 'sweet potatoes'], name: 'Sweet Potato (baked)', unit: '1 medium (114g)', cal: 112, p: 2.0, c: 26.0, f: 0.1 },
-  { keys: ['salad', 'green salad', 'mixed salad'], name: 'Garden Green Salad', unit: '1 bowl (100g)', cal: 45, p: 1.8, c: 8.0, f: 0.8 },
-  { keys: ['broccoli'], name: 'Broccoli (steamed)', unit: '1 cup (91g)', cal: 35, p: 2.6, c: 6.0, f: 0.4 },
+  // ===== SOUTH INDIAN BREAKFASTS =====
+  { keys: ['idli', 'idlis'], name: 'Idli', unit: '2 pieces (80g)', cal: 120, p: 3.5, c: 24.0, f: 0.5, category: 'grain', dietType: 'veg' },
+  { keys: ['dosa', 'masala dosa', 'plain dosa'], name: 'Dosa (plain)', unit: '1 piece (60g)', cal: 130, p: 3.0, c: 22.0, f: 3.5, category: 'grain', dietType: 'veg' },
+  { keys: ['upma', 'rava upma', 'semolina upma'], name: 'Upma', unit: '1 bowl (200g)', cal: 210, p: 5.0, c: 32.0, f: 7.0, category: 'grain', dietType: 'veg' },
+  { keys: ['poha', 'flattened rice', 'chivda poha'], name: 'Poha', unit: '1 bowl (200g)', cal: 245, p: 4.5, c: 42.0, f: 6.5, category: 'grain', dietType: 'veg' },
+  { keys: ['uttapam', 'uttappam'], name: 'Uttapam', unit: '1 piece (120g)', cal: 185, p: 5.0, c: 30.0, f: 5.0, category: 'grain', dietType: 'veg' },
+  { keys: ['dhokla'], name: 'Dhokla', unit: '3 pieces (100g)', cal: 160, p: 7.0, c: 25.0, f: 3.0, category: 'grain', dietType: 'veg' },
+  { keys: ['sabudana khichdi', 'sabudana'], name: 'Sabudana Khichdi', unit: '1 bowl (200g)', cal: 280, p: 4.0, c: 48.0, f: 8.0, category: 'grain', dietType: 'veg' },
+  { keys: ['besan chilla', 'besan cheela', 'chickpea pancake'], name: 'Besan Chilla', unit: '1 piece (80g)', cal: 145, p: 7.0, c: 15.0, f: 6.5, category: 'grain', dietType: 'veg' },
+  { keys: ['moong dal chilla', 'moong cheela'], name: 'Moong Dal Chilla', unit: '1 piece (80g)', cal: 120, p: 8.0, c: 14.0, f: 3.5, category: 'legume', dietType: 'veg' },
+  { keys: ['granola', 'granola cereal'], name: 'Granola', unit: '0.5 cup (60g)', cal: 270, p: 6.0, c: 40.0, f: 10.0, category: 'grain', dietType: 'veg' },
+  { keys: ['muesli'], name: 'Muesli', unit: '0.5 cup (55g)', cal: 190, p: 5.0, c: 36.0, f: 3.5, category: 'grain', dietType: 'veg' },
+  { keys: ['overnight oats'], name: 'Overnight Oats', unit: '1 jar (250g)', cal: 310, p: 12.0, c: 45.0, f: 9.0, category: 'grain', dietType: 'veg' },
+  { keys: ['protein pancakes', 'protein pancake'], name: 'Protein Pancakes', unit: '2 pancakes (120g)', cal: 220, p: 20.0, c: 22.0, f: 5.0, category: 'grain', dietType: 'egg' },
 
-  // Nuts, Fats & Spreads
-  { keys: ['peanut butter', 'pb'], name: 'Peanut Butter', unit: '1 tbsp (16g)', cal: 95, p: 4.0, c: 3.2, f: 8.0 },
-  { keys: ['almonds', 'badam'], name: 'Almonds', unit: '1 handful (28g)', cal: 164, p: 6.0, c: 6.0, f: 14.0 },
-  { keys: ['walnuts', 'akhrot'], name: 'Walnuts', unit: '1 handful (28g)', cal: 185, p: 4.3, c: 3.9, f: 18.5 },
-  { keys: ['olive oil', 'oil'], name: 'Olive Oil', unit: '1 tbsp (14g)', cal: 120, p: 0, c: 0, f: 13.5 },
-  { keys: ['butter', 'ghee'], name: 'Butter / Ghee', unit: '1 tbsp (14g)', cal: 102, p: 0.1, c: 0, f: 11.5 }
+  // ===== PROTEINS & MEATS =====
+  { keys: ['chicken breast', 'grilled chicken breast', 'boiled chicken breast'], name: 'Chicken Breast (skinless)', unit: '100g cooked', cal: 165, p: 31.0, c: 0, f: 3.6, perGram: 100, category: 'protein', dietType: 'nonveg' },
+  { keys: ['chicken', 'chicken curry', 'cooked chicken'], name: 'Chicken', unit: '100g cooked', cal: 215, p: 24.0, c: 1.0, f: 12.0, perGram: 100, category: 'protein', dietType: 'nonveg' },
+  { keys: ['chicken tikka', 'tikka chicken'], name: 'Chicken Tikka', unit: '100g', cal: 175, p: 28.0, c: 3.0, f: 6.0, perGram: 100, category: 'protein', dietType: 'nonveg' },
+  { keys: ['tandoori chicken'], name: 'Tandoori Chicken', unit: '1 leg piece (120g)', cal: 220, p: 30.0, c: 2.0, f: 10.0, category: 'protein', dietType: 'nonveg' },
+  { keys: ['butter chicken'], name: 'Butter Chicken', unit: '1 serving (200g)', cal: 380, p: 26.0, c: 12.0, f: 26.0, category: 'protein', dietType: 'nonveg' },
+  { keys: ['chicken biryani'], name: 'Chicken Biryani', unit: '1 plate (300g)', cal: 490, p: 22.0, c: 62.0, f: 16.0, category: 'grain', dietType: 'nonveg' },
+  { keys: ['egg white', 'boiled egg white', 'egg whites'], name: 'Egg White', unit: '1 large (33g)', cal: 17, p: 3.6, c: 0.2, f: 0.1, category: 'protein', dietType: 'egg' },
+  { keys: ['egg', 'boiled egg', 'large egg', 'whole egg', 'eggs'], name: 'Whole Egg', unit: '1 large (50g)', cal: 72, p: 6.3, c: 0.4, f: 4.8, category: 'protein', dietType: 'egg' },
+  { keys: ['omelet', 'omelette', 'scrambled eggs', 'scrambled egg'], name: 'Omelet (2 eggs)', unit: '2 eggs (100g)', cal: 180, p: 13.0, c: 1.2, f: 14.0, category: 'protein', dietType: 'egg' },
+  { keys: ['egg bhurji', 'anda bhurji'], name: 'Egg Bhurji', unit: '2 eggs (120g)', cal: 200, p: 13.0, c: 3.0, f: 15.0, category: 'protein', dietType: 'egg' },
+  { keys: ['egg curry', 'anda curry'], name: 'Egg Curry', unit: '2 eggs with gravy (200g)', cal: 260, p: 14.0, c: 8.0, f: 18.0, category: 'protein', dietType: 'egg' },
+  { keys: ['salmon', 'grilled salmon'], name: 'Salmon', unit: '100g cooked', cal: 208, p: 20.4, c: 0, f: 13.4, perGram: 100, category: 'protein', dietType: 'nonveg' },
+  { keys: ['tuna', 'canned tuna'], name: 'Tuna (canned in water)', unit: '1 can (120g drained)', cal: 130, p: 29.0, c: 0, f: 1.0, category: 'protein', dietType: 'nonveg' },
+  { keys: ['beef', 'ground beef', 'steak', 'lean beef'], name: 'Lean Beef', unit: '100g cooked', cal: 215, p: 26.0, c: 0, f: 11.5, perGram: 100, category: 'protein', dietType: 'nonveg' },
+  { keys: ['fish curry', 'machli curry', 'fish masala'], name: 'Fish Curry', unit: '1 serving (200g)', cal: 260, p: 22.0, c: 8.0, f: 15.0, category: 'protein', dietType: 'nonveg' },
+  { keys: ['fish fry', 'fried fish', 'tawa fish'], name: 'Fish Fry (pan-fried)', unit: '1 piece (100g)', cal: 195, p: 20.0, c: 5.0, f: 10.0, perGram: 100, category: 'protein', dietType: 'nonveg' },
+  { keys: ['prawn curry', 'shrimp curry', 'jhinga curry'], name: 'Prawn Curry', unit: '1 serving (200g)', cal: 220, p: 22.0, c: 6.0, f: 12.0, category: 'protein', dietType: 'nonveg' },
+  { keys: ['mutton curry', 'goat curry', 'lamb curry'], name: 'Mutton Curry', unit: '1 serving (200g)', cal: 380, p: 28.0, c: 6.0, f: 28.0, category: 'protein', dietType: 'nonveg' },
+  { keys: ['keema', 'mutton keema', 'chicken keema'], name: 'Keema', unit: '1 bowl (150g)', cal: 290, p: 22.0, c: 4.0, f: 20.0, category: 'protein', dietType: 'nonveg' },
+  { keys: ['turkey breast', 'turkey'], name: 'Turkey Breast', unit: '100g cooked', cal: 135, p: 30.0, c: 0, f: 1.0, perGram: 100, category: 'protein', dietType: 'nonveg' },
+  { keys: ['ground turkey'], name: 'Ground Turkey (lean)', unit: '100g cooked', cal: 170, p: 27.0, c: 0, f: 6.5, perGram: 100, category: 'protein', dietType: 'nonveg' },
+  { keys: ['lean pork', 'pork tenderloin', 'pork'], name: 'Lean Pork', unit: '100g cooked', cal: 185, p: 26.0, c: 0, f: 8.5, perGram: 100, category: 'protein', dietType: 'nonveg' },
+  { keys: ['whey protein', 'whey', 'protein powder', 'protein shake', 'protein scoop'], name: 'Whey Protein', unit: '1 scoop (30g)', cal: 120, p: 24.0, c: 3.0, f: 1.5, category: 'protein', dietType: 'veg' },
+  { keys: ['protein bar', 'energy bar'], name: 'Protein Bar', unit: '1 bar (60g)', cal: 210, p: 20.0, c: 22.0, f: 7.0, category: 'protein', dietType: 'veg' },
+
+  // ===== DAIRY & PLANT PROTEINS =====
+  { keys: ['paneer', 'cottage cheese'], name: 'Paneer', unit: '100g', cal: 265, p: 18.0, c: 4.0, f: 20.0, perGram: 100, category: 'protein', dietType: 'veg' },
+  { keys: ['paneer tikka', 'grilled paneer'], name: 'Paneer Tikka', unit: '100g', cal: 230, p: 18.0, c: 5.0, f: 16.0, perGram: 100, category: 'protein', dietType: 'veg' },
+  { keys: ['palak paneer', 'spinach paneer'], name: 'Palak Paneer', unit: '1 serving (200g)', cal: 330, p: 16.0, c: 10.0, f: 25.0, category: 'protein', dietType: 'veg' },
+  { keys: ['tofu', 'firm tofu'], name: 'Tofu', unit: '100g', cal: 83, p: 8.8, c: 1.9, f: 4.8, perGram: 100, category: 'protein', dietType: 'vegan' },
+  { keys: ['tempeh'], name: 'Tempeh', unit: '100g', cal: 192, p: 20.0, c: 7.5, f: 11.0, perGram: 100, category: 'protein', dietType: 'vegan' },
+  { keys: ['seitan', 'wheat gluten'], name: 'Seitan', unit: '100g', cal: 150, p: 25.0, c: 6.0, f: 2.0, perGram: 100, category: 'protein', dietType: 'vegan' },
+  { keys: ['milk', 'whole milk', 'full cream milk', 'cow milk'], name: 'Whole Milk', unit: '1 cup (240ml)', cal: 150, p: 8.0, c: 12.0, f: 8.0, category: 'dairy', dietType: 'veg' },
+  { keys: ['skim milk', 'low fat milk', 'skimmed milk'], name: 'Low-Fat Milk', unit: '1 cup (240ml)', cal: 90, p: 8.5, c: 12.5, f: 0.2, category: 'dairy', dietType: 'veg' },
+  { keys: ['curd', 'yogurt', 'dahi'], name: 'Curd / Yogurt', unit: '1 bowl (150g)', cal: 92, p: 5.3, c: 7.0, f: 5.0, category: 'dairy', dietType: 'veg' },
+  { keys: ['greek yogurt', 'plain greek yogurt'], name: 'Greek Yogurt (non-fat)', unit: '1 cup (150g)', cal: 90, p: 15.0, c: 5.0, f: 0.5, category: 'dairy', dietType: 'veg' },
+  { keys: ['buttermilk', 'chaas', 'mattha'], name: 'Buttermilk / Chaas', unit: '1 glass (200ml)', cal: 40, p: 2.5, c: 5.0, f: 1.0, category: 'dairy', dietType: 'veg' },
+  { keys: ['lassi', 'sweet lassi', 'mango lassi'], name: 'Lassi', unit: '1 glass (250ml)', cal: 180, p: 6.0, c: 28.0, f: 5.0, category: 'dairy', dietType: 'veg' },
+  { keys: ['cottage cheese', 'ricotta'], name: 'Ricotta Cheese', unit: '0.5 cup (124g)', cal: 180, p: 14.0, c: 6.0, f: 12.0, category: 'dairy', dietType: 'veg' },
+  { keys: ['mozzarella', 'mozzarella cheese'], name: 'Mozzarella Cheese', unit: '30g', cal: 85, p: 6.0, c: 1.0, f: 6.0, category: 'dairy', dietType: 'veg' },
+  { keys: ['cheese', 'cheddar', 'cheese slice'], name: 'Cheddar Cheese', unit: '1 slice (28g)', cal: 113, p: 7.0, c: 0.4, f: 9.3, category: 'dairy', dietType: 'veg' },
+
+  // ===== LEGUMES & PULSES =====
+  { keys: ['dal', 'lentil', 'lentil soup', 'yellow dal', 'moong dal', 'toor dal', 'daal'], name: 'Dal (cooked lentils)', unit: '1 bowl (150g)', cal: 150, p: 9.0, c: 20.0, f: 3.5, category: 'legume', dietType: 'veg' },
+  { keys: ['masoor dal', 'red lentils'], name: 'Masoor Dal', unit: '1 bowl (150g)', cal: 140, p: 10.0, c: 22.0, f: 1.0, category: 'legume', dietType: 'veg' },
+  { keys: ['chana dal'], name: 'Chana Dal', unit: '1 bowl (150g)', cal: 160, p: 10.5, c: 24.0, f: 2.5, category: 'legume', dietType: 'veg' },
+  { keys: ['dal makhani', 'makhani dal', 'black dal'], name: 'Dal Makhani', unit: '1 bowl (200g)', cal: 280, p: 12.0, c: 28.0, f: 14.0, category: 'legume', dietType: 'veg' },
+  { keys: ['chickpeas', 'chana', 'chole'], name: 'Cooked Chickpeas / Chole', unit: '1 bowl (150g)', cal: 240, p: 12.0, c: 40.0, f: 4.0, category: 'legume', dietType: 'veg' },
+  { keys: ['kidney beans', 'rajma'], name: 'Kidney Beans / Rajma', unit: '1 bowl (150g)', cal: 215, p: 13.0, c: 38.0, f: 1.0, category: 'legume', dietType: 'veg' },
+  { keys: ['sprouts', 'moong sprouts', 'sprouted moong'], name: 'Sprouts', unit: '1 bowl (100g)', cal: 85, p: 7.5, c: 12.0, f: 0.5, category: 'legume', dietType: 'veg' },
+  { keys: ['soybeans', 'soya chunks', 'soya', 'soy'], name: 'Soya Chunks (cooked)', unit: '1 bowl (100g)', cal: 170, p: 26.0, c: 12.0, f: 1.0, perGram: 100, category: 'protein', dietType: 'vegan' },
+  { keys: ['hummus'], name: 'Hummus', unit: '2 tbsp (30g)', cal: 70, p: 2.5, c: 6.0, f: 4.5, category: 'legume', dietType: 'vegan' },
+  { keys: ['falafel'], name: 'Falafel', unit: '3 pieces (90g)', cal: 200, p: 8.0, c: 22.0, f: 9.0, category: 'legume', dietType: 'vegan' },
+  { keys: ['lentil soup'], name: 'Lentil Soup', unit: '1 bowl (240ml)', cal: 170, p: 10.0, c: 28.0, f: 2.0, category: 'legume', dietType: 'vegan' },
+
+  // ===== INDIAN CURRIES & DISHES (VEG) =====
+  { keys: ['aloo gobi', 'potato cauliflower'], name: 'Aloo Gobi', unit: '1 serving (200g)', cal: 180, p: 4.0, c: 22.0, f: 9.0, category: 'vegetable', dietType: 'veg' },
+  { keys: ['baingan bharta', 'baingan', 'eggplant bharta'], name: 'Baingan Bharta', unit: '1 serving (200g)', cal: 160, p: 3.5, c: 14.0, f: 10.0, category: 'vegetable', dietType: 'veg' },
+  { keys: ['mixed veg curry', 'mixed vegetable', 'sabzi'], name: 'Mixed Veg Curry', unit: '1 serving (200g)', cal: 170, p: 5.0, c: 18.0, f: 8.5, category: 'vegetable', dietType: 'veg' },
+  { keys: ['vegetable biryani', 'veg biryani'], name: 'Vegetable Biryani', unit: '1 plate (300g)', cal: 380, p: 8.0, c: 58.0, f: 13.0, category: 'grain', dietType: 'veg' },
+  { keys: ['khichdi', 'moong dal khichdi'], name: 'Khichdi', unit: '1 bowl (250g)', cal: 220, p: 8.0, c: 36.0, f: 5.0, category: 'grain', dietType: 'veg' },
+  { keys: ['pulao', 'veg pulao', 'vegetable pulao'], name: 'Veg Pulao', unit: '1 plate (250g)', cal: 300, p: 6.0, c: 50.0, f: 8.5, category: 'grain', dietType: 'veg' },
+  { keys: ['jeera rice', 'cumin rice'], name: 'Jeera Rice', unit: '1 bowl (200g)', cal: 230, p: 4.5, c: 44.0, f: 4.5, category: 'grain', dietType: 'veg' },
+  { keys: ['lemon rice'], name: 'Lemon Rice', unit: '1 bowl (200g)', cal: 240, p: 4.0, c: 45.0, f: 5.0, category: 'grain', dietType: 'veg' },
+  { keys: ['sambar'], name: 'Sambar', unit: '1 bowl (200g)', cal: 130, p: 6.0, c: 18.0, f: 3.5, category: 'legume', dietType: 'veg' },
+  { keys: ['rasam'], name: 'Rasam', unit: '1 bowl (200g)', cal: 45, p: 2.0, c: 8.0, f: 0.5, category: 'vegetable', dietType: 'veg' },
+  { keys: ['bhindi masala', 'okra', 'bhindi'], name: 'Bhindi Masala', unit: '1 serving (150g)', cal: 120, p: 3.0, c: 12.0, f: 7.0, category: 'vegetable', dietType: 'veg' },
+  { keys: ['matar paneer', 'peas paneer'], name: 'Matar Paneer', unit: '1 serving (200g)', cal: 310, p: 14.0, c: 14.0, f: 22.0, category: 'protein', dietType: 'veg' },
+  { keys: ['chana masala', 'chole masala'], name: 'Chana Masala', unit: '1 serving (200g)', cal: 260, p: 12.0, c: 38.0, f: 7.0, category: 'legume', dietType: 'veg' },
+
+  // ===== FRUITS =====
+  { keys: ['banana', 'ripe banana', 'bananas'], name: 'Banana', unit: '1 medium (118g)', cal: 105, p: 1.3, c: 27.0, f: 0.3, category: 'fruit', dietType: 'veg' },
+  { keys: ['apple', 'apples'], name: 'Apple', unit: '1 medium (182g)', cal: 95, p: 0.5, c: 25.0, f: 0.3, category: 'fruit', dietType: 'veg' },
+  { keys: ['orange', 'oranges'], name: 'Orange', unit: '1 medium (131g)', cal: 62, p: 1.2, c: 15.4, f: 0.2, category: 'fruit', dietType: 'veg' },
+  { keys: ['mango', 'mangoes'], name: 'Mango', unit: '1 cup sliced (165g)', cal: 99, p: 1.4, c: 25.0, f: 0.6, category: 'fruit', dietType: 'veg' },
+  { keys: ['papaya'], name: 'Papaya', unit: '1 cup cubed (145g)', cal: 62, p: 0.7, c: 16.0, f: 0.4, category: 'fruit', dietType: 'veg' },
+  { keys: ['watermelon'], name: 'Watermelon', unit: '1 cup diced (152g)', cal: 46, p: 0.9, c: 11.5, f: 0.2, category: 'fruit', dietType: 'veg' },
+  { keys: ['grapes'], name: 'Grapes', unit: '1 cup (150g)', cal: 104, p: 1.1, c: 27.0, f: 0.2, category: 'fruit', dietType: 'veg' },
+  { keys: ['pomegranate', 'anaar'], name: 'Pomegranate', unit: '1 cup seeds (174g)', cal: 144, p: 2.9, c: 33.0, f: 2.0, category: 'fruit', dietType: 'veg' },
+  { keys: ['guava', 'amrood'], name: 'Guava', unit: '1 medium (55g)', cal: 37, p: 1.4, c: 8.0, f: 0.5, category: 'fruit', dietType: 'veg' },
+  { keys: ['berries', 'mixed berries', 'blueberries', 'strawberries'], name: 'Mixed Berries', unit: '1 cup (150g)', cal: 70, p: 1.0, c: 17.0, f: 0.5, category: 'fruit', dietType: 'veg' },
+  { keys: ['dates', 'khajur', 'medjool dates'], name: 'Dates', unit: '3 pieces (50g)', cal: 140, p: 1.0, c: 37.0, f: 0.1, category: 'fruit', dietType: 'veg' },
+
+  // ===== VEGETABLES =====
+  { keys: ['potato', 'boiled potato', 'potatoes'], name: 'Potato (boiled)', unit: '1 medium (173g)', cal: 160, p: 4.3, c: 37.0, f: 0.2, category: 'carb', dietType: 'veg' },
+  { keys: ['sweet potato', 'sweet potatoes', 'shakarkandi'], name: 'Sweet Potato (baked)', unit: '1 medium (114g)', cal: 112, p: 2.0, c: 26.0, f: 0.1, category: 'carb', dietType: 'veg' },
+  { keys: ['salad', 'green salad', 'mixed salad'], name: 'Garden Green Salad', unit: '1 bowl (100g)', cal: 45, p: 1.8, c: 8.0, f: 0.8, category: 'vegetable', dietType: 'veg' },
+  { keys: ['broccoli'], name: 'Broccoli (steamed)', unit: '1 cup (91g)', cal: 35, p: 2.6, c: 6.0, f: 0.4, category: 'vegetable', dietType: 'veg' },
+  { keys: ['spinach', 'palak', 'cooked spinach'], name: 'Spinach (cooked)', unit: '1 cup (180g)', cal: 40, p: 5.0, c: 7.0, f: 0.5, category: 'vegetable', dietType: 'veg' },
+  { keys: ['cauliflower', 'gobi'], name: 'Cauliflower (cooked)', unit: '1 cup (124g)', cal: 29, p: 2.2, c: 5.0, f: 0.3, category: 'vegetable', dietType: 'veg' },
+  { keys: ['green beans', 'french beans'], name: 'Green Beans', unit: '1 cup (125g)', cal: 35, p: 2.0, c: 7.0, f: 0.2, category: 'vegetable', dietType: 'veg' },
+  { keys: ['mushroom', 'mushrooms'], name: 'Mushrooms (cooked)', unit: '1 cup (156g)', cal: 44, p: 3.4, c: 8.0, f: 0.5, category: 'vegetable', dietType: 'veg' },
+  { keys: ['tomato', 'tomatoes'], name: 'Tomato', unit: '1 medium (123g)', cal: 22, p: 1.1, c: 4.8, f: 0.2, category: 'vegetable', dietType: 'veg' },
+  { keys: ['cucumber', 'kheera'], name: 'Cucumber', unit: '1 medium (200g)', cal: 30, p: 1.4, c: 6.0, f: 0.2, category: 'vegetable', dietType: 'veg' },
+  { keys: ['carrot', 'carrots', 'gajar'], name: 'Carrot', unit: '1 medium (61g)', cal: 25, p: 0.6, c: 6.0, f: 0.1, category: 'vegetable', dietType: 'veg' },
+  { keys: ['bell pepper', 'capsicum', 'shimla mirch'], name: 'Bell Pepper', unit: '1 medium (120g)', cal: 30, p: 1.2, c: 6.0, f: 0.3, category: 'vegetable', dietType: 'veg' },
+  { keys: ['avocado'], name: 'Avocado', unit: '0.5 fruit (68g)', cal: 114, p: 1.3, c: 6.0, f: 10.5, category: 'fat', dietType: 'vegan' },
+  { keys: ['corn', 'sweet corn', 'bhutta'], name: 'Sweet Corn', unit: '1 ear (90g)', cal: 85, p: 3.0, c: 19.0, f: 1.0, category: 'carb', dietType: 'veg' },
+  { keys: ['grilled vegetables', 'roasted vegetables', 'grilled veggies'], name: 'Grilled Vegetables', unit: '1 cup (180g)', cal: 100, p: 3.0, c: 15.0, f: 4.0, category: 'vegetable', dietType: 'vegan' },
+  { keys: ['roasted sweet potato'], name: 'Roasted Sweet Potato', unit: '1 cup (200g)', cal: 180, p: 4.0, c: 42.0, f: 0.3, category: 'carb', dietType: 'vegan' },
+
+  // ===== NUTS, FATS & SPREADS =====
+  { keys: ['peanut butter', 'pb'], name: 'Peanut Butter', unit: '1 tbsp (16g)', cal: 95, p: 4.0, c: 3.2, f: 8.0, category: 'fat', dietType: 'veg' },
+  { keys: ['almonds', 'badam'], name: 'Almonds', unit: '1 handful (28g)', cal: 164, p: 6.0, c: 6.0, f: 14.0, category: 'fat', dietType: 'veg' },
+  { keys: ['walnuts', 'akhrot'], name: 'Walnuts', unit: '1 handful (28g)', cal: 185, p: 4.3, c: 3.9, f: 18.5, category: 'fat', dietType: 'veg' },
+  { keys: ['cashews', 'kaju'], name: 'Cashews', unit: '1 handful (28g)', cal: 155, p: 5.2, c: 9.0, f: 12.5, category: 'fat', dietType: 'veg' },
+  { keys: ['peanuts', 'moongphali'], name: 'Peanuts', unit: '1 handful (28g)', cal: 160, p: 7.0, c: 4.5, f: 14.0, category: 'fat', dietType: 'veg' },
+  { keys: ['flax seeds', 'alsi'], name: 'Flax Seeds', unit: '1 tbsp (10g)', cal: 55, p: 2.0, c: 3.0, f: 4.3, category: 'fat', dietType: 'vegan' },
+  { keys: ['chia seeds'], name: 'Chia Seeds', unit: '1 tbsp (12g)', cal: 58, p: 2.0, c: 5.0, f: 3.7, category: 'fat', dietType: 'vegan' },
+  { keys: ['olive oil', 'oil'], name: 'Olive Oil', unit: '1 tbsp (14g)', cal: 120, p: 0, c: 0, f: 13.5, category: 'fat', dietType: 'vegan' },
+  { keys: ['coconut oil'], name: 'Coconut Oil', unit: '1 tbsp (14g)', cal: 121, p: 0, c: 0, f: 13.5, category: 'fat', dietType: 'vegan' },
+  { keys: ['butter', 'ghee'], name: 'Butter / Ghee', unit: '1 tbsp (14g)', cal: 102, p: 0.1, c: 0, f: 11.5, category: 'fat', dietType: 'veg' },
+
+  // ===== SOUPS & LIGHT MEALS =====
+  { keys: ['chicken soup', 'chicken broth'], name: 'Chicken Soup', unit: '1 bowl (240ml)', cal: 120, p: 10.0, c: 10.0, f: 4.0, category: 'protein', dietType: 'nonveg' },
+  { keys: ['minestrone', 'vegetable soup', 'veg soup'], name: 'Vegetable Soup', unit: '1 bowl (240ml)', cal: 90, p: 3.5, c: 16.0, f: 1.5, category: 'vegetable', dietType: 'vegan' },
+  { keys: ['tomato soup'], name: 'Tomato Soup', unit: '1 bowl (240ml)', cal: 100, p: 2.5, c: 18.0, f: 2.0, category: 'vegetable', dietType: 'veg' },
+
+  // ===== SNACKS & MISC =====
+  { keys: ['pav bhaji'], name: 'Pav Bhaji', unit: '1 plate (300g)', cal: 400, p: 10.0, c: 52.0, f: 18.0, category: 'grain', dietType: 'veg' },
+  { keys: ['samosa'], name: 'Samosa', unit: '1 piece (80g)', cal: 240, p: 4.0, c: 26.0, f: 13.0, category: 'grain', dietType: 'veg' },
+  { keys: ['vada pav'], name: 'Vada Pav', unit: '1 piece (150g)', cal: 290, p: 6.0, c: 38.0, f: 13.0, category: 'grain', dietType: 'veg' },
+  { keys: ['dahi vada', 'dahi bhalla'], name: 'Dahi Vada', unit: '2 pieces (150g)', cal: 200, p: 7.0, c: 28.0, f: 7.0, category: 'legume', dietType: 'veg' }
 ];
 
 function parseSingleFoodItem(text) {
@@ -507,45 +856,73 @@ function calculateFoodNutrition(query) {
   };
 }
 
-// Gemini AI Call Helper with fallback models
+// AI Food & Meal Scanner Helper (Server-side proxy with client-side fallback)
 async function callGeminiFoodApi(apiKey, promptText, inlineData = null) {
   if (!navigator.onLine) {
-    throw new Error('You\u2019re offline. Food AI lookup requires an active internet connection.');
-  }
-  const models = ['gemini-3.6-flash', 'gemini-2.5-flash', 'gemini-flash-latest'];
-  let parts = [{ text: promptText }];
-  if (inlineData) {
-    parts.push({ inlineData });
+    throw new Error('You’re offline. Food AI lookup requires an active internet connection.');
   }
 
-  let lastErr = null;
-  for (const model of models) {
-    try {
-      const resp = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`,
-        {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            contents: [{ parts }],
-            generationConfig: { temperature: 0.1, responseMimeType: 'application/json' }
-          })
-        }
-      );
-      if (resp.ok) {
-        const data = await resp.json();
-        const rawText = data?.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
-        const cleanJson = rawText.replace(/```json/g, '').replace(/```/g, '').trim();
-        return JSON.parse(cleanJson);
-      } else {
-        const errObj = await resp.json().catch(() => ({}));
-        lastErr = new Error(errObj?.error?.message || `HTTP ${resp.status}`);
+  // 1. Primary: Server-side secure AI endpoint
+  try {
+    const resp = await fetch('/api/ai/analyze-food', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ promptText, inlineData })
+    });
+    if (resp.ok) {
+      const result = await resp.json();
+      if (result.ok && result.data) {
+        return result.data;
       }
-    } catch (e) {
-      lastErr = e;
+    } else {
+      const errObj = await resp.json().catch(() => ({}));
+      if (resp.status !== 503 || !apiKey) {
+        throw new Error(errObj.error || `Server AI error (${resp.status})`);
+      }
+    }
+  } catch (backendErr) {
+    if (!apiKey) {
+      throw backendErr;
     }
   }
-  throw lastErr || new Error('Gemini API call failed');
+
+  // 2. Fallback: Direct client-side call if a local override key is provided
+  if (apiKey) {
+    const models = ['gemini-2.5-flash', 'gemini-1.5-flash', 'gemini-flash-latest'];
+    let parts = [{ text: promptText }];
+    if (inlineData) {
+      parts.push({ inlineData });
+    }
+
+    let lastErr = null;
+    for (const model of models) {
+      try {
+        const resp = await fetch(
+          `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              contents: [{ parts }],
+              generationConfig: { temperature: 0.1, responseMimeType: 'application/json' }
+            })
+          }
+        );
+        if (resp.ok) {
+          const data = await resp.json();
+          const rawText = data?.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
+          const cleanJson = rawText.replace(/```json/g, '').replace(/```/g, '').trim();
+          return JSON.parse(cleanJson);
+        } else {
+          const errObj = await resp.json().catch(() => ({}));
+          lastErr = new Error(errObj?.error?.message || `HTTP ${resp.status}`);
+        }
+      } catch (e) {
+        lastErr = e;
+      }
+    }
+    throw lastErr || new Error('Gemini API call failed');
+  }
 }
 
 // ==========================================
@@ -849,6 +1226,43 @@ const Icons = {
       <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14" />
       <polyline points="22 4 12 14.01 9 11.01" />
     </svg>
+  ),
+  Diet: ({ className = 'w-5 h-5', active }) => (
+    <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={active ? '2.4' : '1.8'} strokeLinecap="round" strokeLinejoin="round">
+      <path d="M12 2L2 7v10l10 5 10-5V7L12 2z" />
+      <path d="M12 22V12" />
+      <path d="M12 12L2 7" />
+      <path d="M12 12l10-5" />
+    </svg>
+  ),
+  Crown: ({ className = 'w-5 h-5' }) => (
+    <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M2 20h20" />
+      <path d="M4 20V9l4 3 4-7 4 7 4-3v11" />
+    </svg>
+  ),
+  Lock: ({ className = 'w-5 h-5' }) => (
+    <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <rect x="3" y="11" width="18" height="11" rx="3" ry="3" />
+      <path d="M7 11V7a5 5 0 0 1 10 0v4" />
+    </svg>
+  ),
+  ShoppingCart: ({ className = 'w-5 h-5' }) => (
+    <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <circle cx="9" cy="21" r="1" /><circle cx="20" cy="21" r="1" />
+      <path d="M1 1h4l2.68 13.39a2 2 0 0 0 2 1.61h9.72a2 2 0 0 0 2-1.61L23 6H6" />
+    </svg>
+  ),
+  Star: ({ className = 'w-5 h-5' }) => (
+    <svg className={className} viewBox="0 0 24 24" fill="currentColor" stroke="none">
+      <polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2" />
+    </svg>
+  ),
+  Video: ({ className = 'w-5 h-5' }) => (
+    <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <polygon points="23 7 16 12 23 17 23 7" />
+      <rect x="1" y="5" width="15" height="14" rx="2" ry="2" />
+    </svg>
   )
 };
 
@@ -953,7 +1367,7 @@ function WeightTrendChart({ weightLogs = [] }) {
 // 8. GUIDED SESSION MODE & REST TIMER
 // Full-screen sequential auto-advancing flow
 // ==========================================
-function GuidedSessionMode({ workoutDay, profile, onSaveWorkout, onExit }) {
+function GuidedSessionMode({ workoutDay, profile, onSaveWorkout, onExit, isPro, userKeys, onOpenPaywall }) {
   const exercises = workoutDay.exercises || [];
   const [currentIndex, setCurrentIndex] = useState(0);
   const [currentSet, setCurrentSet] = useState(1);
@@ -997,6 +1411,9 @@ function GuidedSessionMode({ workoutDay, profile, onSaveWorkout, onExit }) {
   }, [status, restSecondsLeft]);
 
   const handleCompleteSet = (trackedReps = null, formFlags = []) => {
+    if ((trackedReps !== null || cameraActive) && !isPro && userKeys) {
+      recordCameraUsage(userKeys);
+    }
     const finalReps = trackedReps !== null ? trackedReps : repsThisSet;
     const logEntry = {
       exerciseName: currentExercise.name,
@@ -1186,19 +1603,50 @@ function GuidedSessionMode({ workoutDay, profile, onSaveWorkout, onExit }) {
                 </button>
               </div>
 
-              {currentExercise.trackable && (
-                <button
-                  onClick={() => setCameraActive((prev) => !prev)}
-                  className={`w-full py-3 px-4 rounded-xl border text-xs font-bold flex items-center justify-center space-x-2 transition-all tap-spring mb-3 ${
-                    cameraActive
-                      ? 'bg-[#3478F7]/20 border-[#3478F7] text-[#3478F7]'
-                      : 'bg-zinc-900/90 border-zinc-800 text-zinc-300 hover:border-zinc-700'
-                  }`}
-                >
-                  <Icons.Camera className="w-4 h-4" />
-                  <span>{cameraActive ? 'Camera Tracking Active' : 'Track with Camera (Auto-Count)'}</span>
-                </button>
-              )}
+              {currentExercise.trackable && (() => {
+                const cameraCheck = canUseCameraTracking(userKeys, isPro);
+                if (!isPro && !cameraCheck.allowed) {
+                  return (
+                    <div className="mb-3 p-3.5 rounded-2xl bg-[#16161A] border border-zinc-800 text-center space-y-1.5 screen-spring-enter shadow-lg">
+                      <div className="flex items-center justify-center space-x-1.5 text-xs font-bold text-zinc-300">
+                        <Icons.Camera className="w-4 h-4 text-[#EC562E]" />
+                        <span>Camera tracking limit reached (3 sets / 7 days)</span>
+                      </div>
+                      <p className="text-[11px] text-zinc-500">
+                        Manual rep counter is active below. Upgrade for unlimited camera form-check.
+                      </p>
+                      <button
+                        type="button"
+                        onClick={onOpenPaywall}
+                        className="inline-flex items-center space-x-1.5 px-3 py-1.5 rounded-xl bg-[#3478F7]/20 border border-[#3478F7]/40 text-xs font-bold text-[#3478F7] hover:bg-[#3478F7]/30 tap-spring mt-1"
+                      >
+                        <Icons.Crown className="w-3.5 h-3.5" />
+                        <span>Upgrade for Unlimited</span>
+                      </button>
+                    </div>
+                  );
+                }
+                return (
+                  <div className="mb-3 space-y-1">
+                    <button
+                      onClick={() => setCameraActive((prev) => !prev)}
+                      className={`w-full py-3 px-4 rounded-xl border text-xs font-bold flex items-center justify-center space-x-2 transition-all tap-spring ${
+                        cameraActive
+                          ? 'bg-[#3478F7]/20 border-[#3478F7] text-[#3478F7]'
+                          : 'bg-zinc-900/90 border-zinc-800 text-zinc-300 hover:border-zinc-700'
+                      }`}
+                    >
+                      <Icons.Camera className="w-4 h-4" />
+                      <span>{cameraActive ? 'Camera Tracking Active' : 'Track with Camera (Auto-Count)'}</span>
+                    </button>
+                    {!isPro && (
+                      <div className="text-center text-[10px] text-zinc-500">
+                        {cameraCheck.remaining} of 3 free camera sets left this week
+                      </div>
+                    )}
+                  </div>
+                );
+              })()}
 
               <button
                 onClick={() => handleCompleteSet(null, [])}
@@ -1587,14 +2035,26 @@ function CameraPoseTracker({ exercise, currentReps, onRepCounted, onCompleteSet,
 // 10. FOOD TAB (Photo Scan + AI Typed + Manual)
 // Strict logger with Gemini API integration
 // ==========================================
-function FoodTab({ foodLogs = [], profile, apiKey, onSaveFood, onDeleteFood, onOpenSettings }) {
+function FoodTab({ 
+  foodLogs = [], 
+  profile, 
+  apiKey, 
+  onSaveFood, 
+  onDeleteFood, 
+  onOpenSettings,
+  isPro,
+  scanCredits = 0,
+  userKeys,
+  onOpenPaywall,
+  onUseCredit
+}) {
   const [selectedDate, setSelectedDate] = useState(new Date().toISOString().slice(0, 10));
   const [typedInput, setTypedInput] = useState('');
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [editableResult, setEditableResult] = useState(null);
   const [showManualModal, setShowManualModal] = useState(false);
   const [manualForm, setManualForm] = useState({ name: '', calories: '', protein: '', carbs: '', fat: '' });
-  const [apiNotice, setApiNotice] = useState(false);
+  const [scanLimitNotice, setScanLimitNotice] = useState(null);
 
   const fileInputRef = useRef(null);
   const targets = useMemo(() => calculateMacros(profile), [profile]);
@@ -1623,7 +2083,7 @@ function FoodTab({ foodLogs = [], profile, apiKey, onSaveFood, onDeleteFood, onO
     const query = typedInput.trim();
     if (!query) return;
 
-    // 1. Instant local calculation from built-in nutrition database
+    // 1. Instant local calculation from built-in nutrition database (always free and instant)
     const localEst = calculateFoodNutrition(query);
     if (localEst) {
       setEditableResult({
@@ -1638,28 +2098,21 @@ function FoodTab({ foodLogs = [], profile, apiKey, onSaveFood, onDeleteFood, onO
       setTypedInput('');
     }
 
-    // 2. If Gemini API key is available, enhance with AI in background
-    if (apiKey) {
-      setIsAnalyzing(true);
-      try {
-        const promptText = `Analyze this food item and return ONLY a strict JSON object with this exact schema: {"name": string, "calories": number, "protein": number, "carbs": number, "fat": number, "confidence": "low"|"medium"|"high"}. If no quantity is specified, assume a standard single serving size. Food: "${query}"`;
-        const parsed = await callGeminiFoodApi(apiKey, promptText);
+    // Check free-tier AI quota
+    const quota = canUseAiScan(userKeys, isPro);
+    let spentCredit = false;
 
-        if (parsed && (parsed.calories !== undefined || parsed.name)) {
-          setEditableResult({
-            name: parsed.name || (localEst ? localEst.name : query),
-            calories: Math.round(Number(parsed.calories) || (localEst ? localEst.calories : 100)),
-            protein: Math.round(Number(parsed.protein) || (localEst ? localEst.protein : 5)),
-            carbs: Math.round(Number(parsed.carbs) || (localEst ? localEst.carbs : 15)),
-            fat: Math.round(Number(parsed.fat) || (localEst ? localEst.fat : 2)),
-            confidence: parsed.confidence || 'high',
-            source: 'ai_text'
-          });
-          setTypedInput('');
-        }
-      } catch (err) {
-        
-        // If local already set, keep it seamlessly; otherwise inform user
+    if (!isPro && !quota.allowed) {
+      const availCredits = userKeys ? getScanCredits(userKeys) : 0;
+      if (availCredits > 0 && userKeys) {
+        useScanCredit(userKeys);
+        spentCredit = true;
+        if (onUseCredit) onUseCredit();
+      } else {
+        // Limit reached and no credits: keep local offline calculation and display inline note
+        setScanLimitNotice({
+          message: 'Daily AI scan limit reached (3 of 3 free daily scans used). Showing offline calculation. Upgrade to Pro for unlimited AI scans, or purchase scan credits.'
+        });
         if (!localEst) {
           setEditableResult({
             name: query,
@@ -1672,21 +2125,47 @@ function FoodTab({ foodLogs = [], profile, apiKey, onSaveFood, onDeleteFood, onO
           });
           setTypedInput('');
         }
-      } finally {
-        setIsAnalyzing(false);
+        return;
       }
-    } else if (!localEst) {
-      setApiNotice(true);
-      setEditableResult({
-        name: query,
-        calories: 100,
-        protein: 5,
-        carbs: 15,
-        fat: 2,
-        confidence: 'low',
-        source: 'estimate'
-      });
-      setTypedInput('');
+    }
+
+    // 2. Enhance with AI in background (via server-side endpoint)
+    setIsAnalyzing(true);
+    try {
+      const promptText = `Analyze this food item and return ONLY a strict JSON object with this exact schema: {"name": string, "calories": number, "protein": number, "carbs": number, "fat": number, "confidence": "low"|"medium"|"high"}. If no quantity is specified, assume a standard single serving size. Food: "${query}"`;
+      const parsed = await callGeminiFoodApi(apiKey, promptText);
+
+      if (parsed && (parsed.calories !== undefined || parsed.name)) {
+        setEditableResult({
+          name: parsed.name || (localEst ? localEst.name : query),
+          calories: Math.round(Number(parsed.calories) || (localEst ? localEst.calories : 100)),
+          protein: Math.round(Number(parsed.protein) || (localEst ? localEst.protein : 5)),
+          carbs: Math.round(Number(parsed.carbs) || (localEst ? localEst.carbs : 15)),
+          fat: Math.round(Number(parsed.fat) || (localEst ? localEst.fat : 2)),
+          confidence: parsed.confidence || 'high',
+          source: 'ai_text'
+        });
+        setTypedInput('');
+        if (!isPro && !spentCredit && userKeys) {
+          recordAiScanUsage(userKeys);
+        }
+      }
+    } catch (err) {
+      // If local already set, keep it seamlessly; otherwise fallback estimate
+      if (!localEst) {
+        setEditableResult({
+          name: query,
+          calories: 120,
+          protein: 6,
+          carbs: 18,
+          fat: 3,
+          confidence: 'low',
+          source: 'estimate'
+        });
+        setTypedInput('');
+      }
+    } finally {
+      setIsAnalyzing(false);
     }
   };
 
@@ -1694,9 +2173,23 @@ function FoodTab({ foodLogs = [], profile, apiKey, onSaveFood, onDeleteFood, onO
     const file = e.target.files?.[0];
     if (!file) return;
 
-    if (!apiKey) {
-      setApiNotice(true);
-      return;
+    // Check free-tier AI quota
+    const quota = canUseAiScan(userKeys, isPro);
+    let spentCredit = false;
+
+    if (!isPro && !quota.allowed) {
+      const availCredits = userKeys ? getScanCredits(userKeys) : 0;
+      if (availCredits > 0 && userKeys) {
+        useScanCredit(userKeys);
+        spentCredit = true;
+        if (onUseCredit) onUseCredit();
+      } else {
+        setScanLimitNotice({
+          message: 'Daily AI photo scan limit reached (3 of 3 free daily scans used). Upgrade to Pro for unlimited plate scans, or purchase scan credits.'
+        });
+        if (fileInputRef.current) fileInputRef.current.value = '';
+        return;
+      }
     }
 
     setIsAnalyzing(true);
@@ -1747,11 +2240,15 @@ function FoodTab({ foodLogs = [], profile, apiKey, onSaveFood, onDeleteFood, onO
         source: 'ai_photo',
         photoRef: photoId
       });
+
+      if (!isPro && !spentCredit && userKeys) {
+        recordAiScanUsage(userKeys);
+      }
     } catch (err) {
-      
-      alert('Photo analysis failed. Please verify internet connection or Gemini API key.');
+      alert(err.message || 'Photo analysis failed. Please verify internet connection or server AI configuration.');
     } finally {
       setIsAnalyzing(false);
+      if (fileInputRef.current) fileInputRef.current.value = '';
     }
   };
 
@@ -1916,6 +2413,66 @@ function FoodTab({ foodLogs = [], profile, apiKey, onSaveFood, onDeleteFood, onO
         </button>
       </form>
 
+      {/* Free Tier Quota & Usage Metering Indicator */}
+      {!isPro && (
+        <div className="flex items-center justify-between text-[10px] text-zinc-500 px-1">
+          <span>
+            Daily free AI scans: {canUseAiScan(userKeys, isPro).remaining} of 3 remaining
+          </span>
+          {scanCredits > 0 ? (
+            <span className="text-[#3478F7] font-bold">
+              {scanCredits} scan credit{scanCredits === 1 ? '' : 's'} available
+            </span>
+          ) : (
+            <button
+              type="button"
+              onClick={onOpenPaywall}
+              className="text-[#3478F7] font-bold hover:underline"
+            >
+              Upgrade &rarr;
+            </button>
+          )}
+        </div>
+      )}
+
+      {/* Inline Upgrade Note when limit reached */}
+      {scanLimitNotice && (
+        <div className="bg-[#16161A] border border-[#EC562E]/40 rounded-2xl p-3.5 space-y-2.5 screen-spring-enter shadow-lg">
+          <div className="flex items-start justify-between">
+            <div className="flex items-center space-x-2">
+              <span className="text-sm">⚡</span>
+              <span className="text-xs font-bold text-white">AI Food Scan Limit Reached</span>
+            </div>
+            <button
+              type="button"
+              onClick={() => setScanLimitNotice(null)}
+              className="text-zinc-500 hover:text-zinc-300 text-xs px-1"
+            >
+              ✕
+            </button>
+          </div>
+          <p className="text-[11px] text-zinc-400 leading-relaxed">
+            {scanLimitNotice.message}
+          </p>
+          <div className="flex items-center space-x-2 pt-0.5">
+            <button
+              type="button"
+              onClick={onOpenPaywall}
+              className="px-3 py-1.5 rounded-xl bg-[#3478F7] hover:bg-blue-600 text-white text-xs font-bold tap-spring shadow-md shadow-[#3478F7]/20"
+            >
+              Upgrade to Pro
+            </button>
+            <button
+              type="button"
+              onClick={onOpenPaywall}
+              className="px-3 py-1.5 rounded-xl bg-zinc-900 border border-zinc-800 text-zinc-300 hover:text-white text-xs font-bold tap-spring"
+            >
+              Buy Scan Credits
+            </button>
+          </div>
+        </div>
+      )}
+
       <div className="grid grid-cols-2 gap-3">
         <input
           type="file"
@@ -1942,18 +2499,6 @@ function FoodTab({ foodLogs = [], profile, apiKey, onSaveFood, onDeleteFood, onO
           <span>Manual Entry</span>
         </button>
       </div>
-
-      {apiNotice && (
-        <div className="bg-[#EC562E]/15 border border-[#EC562E]/30 rounded-2xl p-4 flex items-center justify-between text-xs screen-spring-enter">
-          <span className="text-[#EC562E] font-bold">Add Gemini API key in Settings for AI lookup</span>
-          <button
-            onClick={onOpenSettings}
-            className="px-3 py-1.5 rounded-xl bg-[#EC562E] text-white font-bold tap-spring"
-          >
-            Settings
-          </button>
-        </div>
-      )}
 
       {editableResult && (
         <div className="bg-[#16161A] border border-[#3478F7]/40 rounded-3xl p-5 shadow-2xl screen-spring-enter space-y-4">
@@ -2469,6 +3014,8 @@ function ProfileTab({
   equipment,
   apiKey,
   authUser,
+  isPro,
+  onOpenPaywall,
   onGoogleSignIn,
   onSignOut,
   onTriggerGoogleSignIn,
@@ -2525,6 +3072,48 @@ function ProfileTab({
         >
           Edit Metrics
         </button>
+      </div>
+
+      {/* Subtle, non-naggy Pro Status & Upgrade Entry Point */}
+      <div className="bg-[#101014] border border-zinc-800/80 rounded-3xl p-4 flex items-center justify-between shadow-2xl">
+        <div className="flex items-center space-x-3">
+          <div className={`w-9 h-9 rounded-2xl flex items-center justify-center border shrink-0 ${
+            isPro 
+              ? 'bg-[#3478F7]/20 border-[#3478F7]/40 text-[#3478F7]' 
+              : 'bg-[#EC562E]/15 border-[#EC562E]/30 text-[#EC562E]'
+          }`}>
+            <Icons.Crown className="w-5 h-5" />
+          </div>
+          <div>
+            <div className="flex items-center space-x-2">
+              <span className="text-sm font-black text-white">Dead Lock {isPro ? 'Pro' : 'Free Tier'}</span>
+              <span className={`text-[9px] font-black uppercase px-2 py-0.5 rounded-full border ${
+                isPro 
+                  ? 'bg-[#3478F7]/20 border-[#3478F7]/40 text-[#3478F7]' 
+                  : 'bg-zinc-900 border-zinc-800 text-zinc-400'
+              }`}>
+                {isPro ? 'PRO ACTIVE' : 'FREE'}
+              </span>
+            </div>
+            <p className="text-[11px] text-zinc-500 mt-0.5">
+              {isPro 
+                ? 'Unlimited AI vision, camera tracking, HD video workouts & custom diet plans' 
+                : '3 camera sets/7d · 3 AI scans/day · HD video workouts & diet plan locked'}
+            </p>
+          </div>
+        </div>
+        {!isPro ? (
+          <button
+            onClick={onOpenPaywall}
+            className="px-3.5 py-2 rounded-xl bg-[#3478F7] hover:bg-blue-600 text-xs font-bold text-white tap-spring shadow-lg shadow-[#3478F7]/20 shrink-0 ml-2"
+          >
+            Upgrade
+          </button>
+        ) : (
+          <span className="text-xs font-bold text-[#3478F7] px-2 py-1 shrink-0">
+            Unlocked
+          </span>
+        )}
       </div>
 
       {/* Cross-Platform Google OAuth Dossier Card */}
@@ -2648,26 +3237,37 @@ function ProfileTab({
       </div>
 
       <div className="bg-[#101014] border border-zinc-800/80 rounded-3xl p-5 shadow-2xl space-y-3">
-        <span className="text-xs font-black text-zinc-400 uppercase tracking-wider block">Gemini API Key (Local Device Only)</span>
+        <div className="flex items-center justify-between">
+          <span className="text-xs font-black text-zinc-400 uppercase tracking-wider block">AI Nutrition & Vision Engine</span>
+          <span className="text-[10px] font-bold px-2.5 py-0.5 rounded-full bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 flex items-center">
+            <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 inline-block mr-1.5 animate-pulse"></span>
+            Built-in AI Active
+          </span>
+        </div>
         <p className="text-xs text-zinc-500 leading-relaxed">
-          Required for instant AI text lookup and photo plate scanning. Stored only in your local browser.
+          Photo plate scanning and smart food macro lookups are powered directly by the Dead Lock Engine. No manual API setup needed.
         </p>
 
-        <form onSubmit={handleSaveKey} className="flex space-x-2">
-          <input
-            type="password"
-            placeholder="Paste AI Studio Gemini Key..."
-            value={keyInput}
-            onChange={(e) => setKeyInput(e.target.value)}
-            className="flex-1 bg-black border border-zinc-800 rounded-xl px-3 py-2 text-xs text-white placeholder-zinc-600 focus:outline-none focus:border-[#3478F7]"
-          />
-          <button
-            type="submit"
-            className="px-4 py-2 rounded-xl bg-[#3478F7] text-xs font-bold text-white tap-spring"
-          >
-            {saveSuccess ? 'Saved!' : 'Save'}
-          </button>
-        </form>
+        <details className="text-xs text-zinc-600 pt-1">
+          <summary className="cursor-pointer hover:text-zinc-400 transition-colors font-semibold text-[11px]">
+            Advanced: Custom Gemini Key Override (Optional)
+          </summary>
+          <form onSubmit={handleSaveKey} className="flex space-x-2 mt-2.5">
+            <input
+              type="password"
+              placeholder="Paste custom AI Studio Gemini Key..."
+              value={keyInput}
+              onChange={(e) => setKeyInput(e.target.value)}
+              className="flex-1 bg-black border border-zinc-800 rounded-xl px-3 py-2 text-xs text-white placeholder-zinc-700 focus:outline-none focus:border-[#3478F7]"
+            />
+            <button
+              type="submit"
+              className="px-4 py-2 rounded-xl bg-[#3478F7] text-xs font-bold text-white tap-spring"
+            >
+              {saveSuccess ? 'Saved!' : 'Save'}
+            </button>
+          </form>
+        </details>
       </div>
 
       <div className="bg-[#101014] border border-zinc-800/80 rounded-3xl p-5 shadow-2xl space-y-3">
@@ -3177,12 +3777,904 @@ function EquipmentModal({ currentEquipment = [], onSave, onClose }) {
 }
 
 // ==========================================
+// PAYWALL SCREEN
+// ==========================================
+function PaywallScreen({ isOpen, onClose, onPurchaseSuccess, isPro, scanCredits, userKeys }) {
+  const [purchaseState, setPurchaseState] = useState('idle');
+  const [selectedPlan, setSelectedPlan] = useState('yearly');
+  const [monthlyPrice, setMonthlyPrice] = useState('₹149/mo');
+  const [yearlyPrice, setYearlyPrice] = useState('₹999/yr');
+  const [credits50Price, setCredits50Price] = useState('₹49');
+  const [credits200Price, setCredits200Price] = useState('₹149');
+  const [productsAvailable, setProductsAvailable] = useState(true);
+
+  // Calculate approximate per-month equivalent for yearly - MUST BE AT TOP LEVEL BEFORE ANY RETURN
+  const yearlyPerMonth = useMemo(() => {
+    const num = parseFloat(yearlyPrice.replace(/[^0-9.]/g, ''));
+    if (!isNaN(num) && num > 0) {
+      const perMo = Math.round(num / 12);
+      const symbol = yearlyPrice.includes('₹') ? '₹' : (yearlyPrice.replace(/[0-9.,]/g, '').trim() || '₹');
+      return `${symbol}${perMo}/mo`;
+    }
+    return '₹83/mo';
+  }, [yearlyPrice]);
+
+  useEffect(() => {
+    if (isOpen) {
+      setPurchaseState('idle');
+      if (BillingService.isAvailable()) {
+        BillingService.queryProducts().then(products => {
+          if (products && products.length > 0) {
+            const monthly = products.find(p => p.sku === 'deadlock_pro_monthly' || p.id === 'deadlock_pro_monthly');
+            const yearly = products.find(p => p.sku === 'deadlock_pro_yearly' || p.id === 'deadlock_pro_yearly');
+            const c50 = products.find(p => p.sku === 'deadlock_scan_credits_50' || p.id === 'deadlock_scan_credits_50');
+            const c200 = products.find(p => p.sku === 'deadlock_scan_credits_200' || p.id === 'deadlock_scan_credits_200');
+            if (monthly && (monthly.priceString || monthly.price)) setMonthlyPrice(monthly.priceString || monthly.price);
+            if (yearly && (yearly.priceString || yearly.price)) setYearlyPrice(yearly.priceString || yearly.price);
+            if (c50 && (c50.priceString || c50.price)) setCredits50Price(c50.priceString || c50.price);
+            if (c200 && (c200.priceString || c200.price)) setCredits200Price(c200.priceString || c200.price);
+          }
+        });
+      }
+    }
+  }, [isOpen]);
+
+  if (!isOpen) return null;
+
+  const handlePurchase = async (sku) => {
+    if (!navigator.onLine) {
+      setPurchaseState('network_error');
+      return;
+    }
+    setPurchaseState('loading');
+    
+    // Fallback/simulator when native billing is unavailable (e.g. web testing)
+    if (!BillingService.isAvailable()) {
+      setTimeout(() => {
+        if (sku.includes('credits_50')) {
+          if (userKeys) addScanCredits(userKeys, 50);
+        } else if (sku.includes('credits_200')) {
+          if (userKeys) addScanCredits(userKeys, 200);
+        } else {
+          if (userKeys) localStorage.setItem(userKeys.IS_PRO, 'true');
+        }
+        setPurchaseState('success');
+        setTimeout(() => {
+          onPurchaseSuccess({ sku });
+        }, 1600);
+      }, 900);
+      return;
+    }
+
+    try {
+      const result = await BillingService.purchase(sku);
+      if (result && (result.status === 'success' || result.acknowledged)) {
+        if (sku.includes('credits_50')) {
+          if (userKeys) addScanCredits(userKeys, 50);
+        } else if (sku.includes('credits_200')) {
+          if (userKeys) addScanCredits(userKeys, 200);
+        } else {
+          if (userKeys) localStorage.setItem(userKeys.IS_PRO, 'true');
+        }
+        setPurchaseState('success');
+        setTimeout(() => {
+          onPurchaseSuccess({ sku });
+        }, 1800);
+      } else if (result && (result.status === 'cancelled' || result.userCancelled)) {
+        // User-cancelled: silent dismiss, no error shown
+        setPurchaseState('idle');
+      } else if (result && result.status === 'network_error') {
+        setPurchaseState('network_error');
+      } else {
+        setPurchaseState('failed');
+      }
+    } catch (err) {
+      setPurchaseState('failed');
+    }
+  };
+
+  const handleRestore = async () => {
+    if (!navigator.onLine) {
+      setPurchaseState('network_error');
+      return;
+    }
+    setPurchaseState('loading');
+    try {
+      const result = await BillingService.restorePurchases();
+      if (result && (result.restored || result.active)) {
+        if (userKeys) localStorage.setItem(userKeys.IS_PRO, 'true');
+        setPurchaseState('success');
+        setTimeout(() => {
+          onPurchaseSuccess({ restored: true });
+        }, 1800);
+      } else {
+        setPurchaseState('failed');
+      }
+    } catch (err) {
+      setPurchaseState('failed');
+    }
+  };
+
+  const onSubscribe = () => {
+    const sku = selectedPlan === 'yearly' ? 'deadlock_pro_yearly' : 'deadlock_pro_monthly';
+    handlePurchase(sku);
+  };
+
+  return (
+    <div className="fixed inset-0 z-[60] bg-black/95 backdrop-blur-xl screen-spring-enter flex flex-col p-6 overflow-y-auto">
+      <button 
+        onClick={onClose} 
+        aria-label="Close paywall"
+        className="absolute top-6 right-6 text-zinc-400 hover:text-white p-2 tap-spring"
+      >
+        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+          <line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line>
+        </svg>
+      </button>
+
+      <div className="flex-1 flex flex-col justify-center max-w-md mx-auto w-full pt-8 pb-10">
+        <div className="text-center mb-7">
+          <div className="w-16 h-16 mx-auto bg-gradient-to-br from-[#3478F7]/25 to-[#EC562E]/20 border border-[#3478F7]/40 rounded-3xl flex items-center justify-center mb-3.5 text-[#3478F7] shadow-xl shadow-[#3478F7]/20">
+            <Icons.Crown className="w-8 h-8 text-[#3478F7]" />
+          </div>
+          <h1 className="text-3xl font-display text-white tracking-tight">DEAD // LOCK PRO</h1>
+          <p className="text-xs text-zinc-400 mt-1 uppercase tracking-widest font-semibold">
+            Elite Training &amp; Nutrition Engine
+          </p>
+        </div>
+
+        {/* Headline Benefits List */}
+        <div className="bg-[#101014] border border-zinc-800/80 rounded-3xl p-5 mb-6 space-y-4 shadow-2xl">
+          <div className="flex items-center space-x-3.5">
+            <div className="w-8 h-8 rounded-xl bg-[#EC562E]/15 border border-[#EC562E]/30 flex items-center justify-center text-[#EC562E] shrink-0">
+              <Icons.Video className="w-4 h-4" />
+            </div>
+            <div>
+              <div className="text-sm font-bold text-white">Full HD Video Workouts &amp; Demos</div>
+              <div className="text-[11px] text-zinc-500">Exercise video walkthroughs, technique guides &amp; visual cues</div>
+            </div>
+          </div>
+
+          <div className="flex items-center space-x-3.5">
+            <div className="w-8 h-8 rounded-xl bg-[#3478F7]/15 border border-[#3478F7]/30 flex items-center justify-center text-[#3478F7] shrink-0">
+              <Icons.Camera className="w-4 h-4" />
+            </div>
+            <div>
+              <div className="text-sm font-bold text-white">Unlimited camera form-check</div>
+              <div className="text-[11px] text-zinc-500">Computer vision rep counter &amp; posture checks</div>
+            </div>
+          </div>
+
+          <div className="flex items-center space-x-3.5">
+            <div className="w-8 h-8 rounded-xl bg-[#EC562E]/15 border border-[#EC562E]/30 flex items-center justify-center text-[#EC562E] shrink-0">
+              <Icons.Search className="w-4 h-4" />
+            </div>
+            <div>
+              <div className="text-sm font-bold text-white">Unlimited AI food scanning</div>
+              <div className="text-[11px] text-zinc-500">Instant plate photo scans &amp; smart typed lookups</div>
+            </div>
+          </div>
+
+          <div className="flex items-center space-x-3.5">
+            <div className="w-8 h-8 rounded-xl bg-[#F3D2C6]/15 border border-[#F3D2C6]/30 flex items-center justify-center text-[#F3D2C6] shrink-0">
+              <Icons.Diet className="w-4 h-4" />
+            </div>
+            <div>
+              <div className="text-sm font-bold text-white">Detailed custom diet plans</div>
+              <div className="text-[11px] text-zinc-500">7-day rotating macro meal plans &amp; shopping lists</div>
+            </div>
+          </div>
+
+          <div className="flex items-center space-x-3.5">
+            <div className="w-8 h-8 rounded-xl bg-[#3478F7]/15 border border-[#3478F7]/30 flex items-center justify-center text-[#3478F7] shrink-0">
+              <Icons.Dashboard className="w-4 h-4" />
+            </div>
+            <div>
+              <div className="text-sm font-bold text-white">Full workout &amp; nutrition history</div>
+              <div className="text-[11px] text-zinc-500">Continuous progressive overload tracking</div>
+            </div>
+          </div>
+        </div>
+
+        {/* Subscription Plan Cards */}
+        <div className="grid grid-cols-2 gap-3.5 mb-5">
+          <div
+            onClick={() => setSelectedPlan('monthly')}
+            className={`p-4 rounded-2xl border-2 cursor-pointer transition-all tap-spring flex flex-col justify-between ${
+              selectedPlan === 'monthly'
+                ? 'border-[#3478F7] bg-[#3478F7]/10 shadow-lg shadow-[#3478F7]/10'
+                : 'border-zinc-800 bg-[#16161A] hover:border-zinc-700'
+            }`}
+          >
+            <div>
+              <div className="text-[11px] font-bold text-zinc-400 uppercase tracking-wider">Monthly</div>
+              <div className="text-xl font-black text-white mt-1">{monthlyPrice}</div>
+            </div>
+            <div className="text-[11px] text-zinc-500 mt-2">Billed monthly</div>
+          </div>
+          
+          <div
+            onClick={() => setSelectedPlan('yearly')}
+            className={`p-4 rounded-2xl border-2 cursor-pointer transition-all relative tap-spring flex flex-col justify-between ${
+              selectedPlan === 'yearly'
+                ? 'border-[#EC562E] bg-[#EC562E]/10 shadow-lg shadow-[#EC562E]/15'
+                : 'border-zinc-800 bg-[#16161A] hover:border-zinc-700'
+            }`}
+          >
+            <div className="absolute -top-3 left-1/2 transform -translate-x-1/2 bg-[#EC562E] text-white text-[9px] font-black px-2.5 py-0.5 rounded-full uppercase tracking-wider shadow-md">
+              BEST VALUE
+            </div>
+            <div>
+              <div className="text-[11px] font-bold text-zinc-400 uppercase tracking-wider">Yearly</div>
+              <div className="text-xl font-black text-white mt-1">{yearlyPrice}</div>
+            </div>
+            <div className="text-[11px] font-bold text-[#EC562E] mt-2">
+              {yearlyPerMonth}
+            </div>
+          </div>
+        </div>
+
+        {/* Main Purchase CTA */}
+        <button
+          onClick={onSubscribe}
+          disabled={purchaseState === 'loading' || purchaseState === 'success'}
+          className="w-full bg-[#3478F7] hover:bg-blue-600 active:scale-[0.98] text-white font-black py-4 rounded-2xl tap-spring relative overflow-hidden shadow-xl shadow-[#3478F7]/25 text-sm uppercase tracking-wider"
+        >
+          {purchaseState === 'loading' ? (
+            <span className="flex items-center justify-center space-x-2">
+              <span className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin"></span>
+              <span>Connecting to Store...</span>
+            </span>
+          ) : purchaseState === 'success' ? (
+            <span className="flex items-center justify-center space-x-2 check-spring text-emerald-400">
+              <Icons.Check className="w-5 h-5" />
+              <span>Welcome to Dead Lock Pro!</span>
+            </span>
+          ) : (
+            <span>Subscribe {selectedPlan === 'yearly' ? 'Yearly (Best Value)' : 'Monthly'}</span>
+          )}
+        </button>
+
+        {purchaseState === 'failed' && (
+          <div className="text-rose-400 text-xs text-center font-bold mt-2.5 p-2 rounded-xl bg-rose-500/10 border border-rose-500/20">
+            Purchase declined or could not be completed. Please try again.
+          </div>
+        )}
+        {purchaseState === 'network_error' && (
+          <div className="text-rose-400 text-xs text-center font-bold mt-2.5 p-2 rounded-xl bg-rose-500/10 border border-rose-500/20">
+            Network unavailable. Check your internet connection and retry.
+          </div>
+        )}
+
+        {/* Consumable Scan Credits Option for Non-Subscribers */}
+        {!isPro && (
+          <div className="mt-6 pt-5 border-t border-zinc-800/80">
+            <div className="text-center mb-3">
+              <span className="text-xs font-bold text-zinc-400">Not ready to subscribe?</span>
+              <p className="text-[11px] text-zinc-500 mt-0.5">
+                Buy consumable scan credits for occasional AI food lookups.
+              </p>
+            </div>
+            <div className="grid grid-cols-2 gap-3">
+              <button 
+                onClick={() => handlePurchase('deadlock_scan_credits_50')}
+                disabled={purchaseState === 'loading'}
+                className="bg-[#101014] hover:bg-[#16161A] border border-zinc-800 hover:border-zinc-700 text-white p-3 rounded-xl text-left tap-spring"
+              >
+                <div className="text-xs font-black text-white">50 Credits</div>
+                <div className="text-[11px] font-bold text-[#3478F7] mt-0.5">{credits50Price}</div>
+              </button>
+              <button 
+                onClick={() => handlePurchase('deadlock_scan_credits_200')}
+                disabled={purchaseState === 'loading'}
+                className="bg-[#101014] hover:bg-[#16161A] border border-zinc-800 hover:border-zinc-700 text-white p-3 rounded-xl text-left tap-spring"
+              >
+                <div className="text-xs font-black text-white">200 Credits</div>
+                <div className="text-[11px] font-bold text-[#EC562E] mt-0.5">{credits200Price} (Value)</div>
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* Mandatory Restore Purchases Link */}
+        <div className="mt-6 text-center">
+          <button 
+            onClick={handleRestore} 
+            disabled={purchaseState === 'loading'}
+            className="text-xs font-bold text-zinc-500 hover:text-zinc-300 underline tap-spring"
+          >
+            Restore Purchases
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ==========================================
+// DIET LOCKED PREVIEW
+// ==========================================
+function DietLockedPreview({ onOpenPaywall }) {
+  return (
+    <div className="pb-28 max-w-md mx-auto px-5 pt-4 relative">
+      <div className="mb-6">
+        <h1 className="text-3xl font-display text-white uppercase tracking-tight">Diet Planner</h1>
+        <p className="text-sm text-[#EC562E] font-medium tracking-wide uppercase mt-1">Pro Feature</p>
+      </div>
+      
+      <div className="filter blur-[6px] opacity-40 pointer-events-none space-y-6">
+        <div className="flex space-x-2 overflow-hidden">
+          <div className="w-12 h-16 bg-[#3478F7] rounded-full"></div>
+          <div className="w-12 h-16 bg-zinc-900 rounded-full"></div>
+          <div className="w-12 h-16 bg-zinc-900 rounded-full"></div>
+          <div className="w-12 h-16 bg-zinc-900 rounded-full"></div>
+          <div className="w-12 h-16 bg-zinc-900 rounded-full"></div>
+        </div>
+        
+        <div className="bg-[#16161A] border border-zinc-800 p-4 rounded-2xl">
+          <div className="text-xs font-black uppercase text-zinc-500 mb-3">Breakfast</div>
+          <div className="space-y-2">
+            <div className="flex justify-between">
+              <div className="text-white">Oats & Protein</div>
+              <div className="text-zinc-500 text-sm">450 cal</div>
+            </div>
+            <div className="flex justify-between">
+              <div className="text-white">Black Coffee</div>
+              <div className="text-zinc-500 text-sm">5 cal</div>
+            </div>
+          </div>
+        </div>
+
+        <div className="bg-[#16161A] border border-zinc-800 p-4 rounded-2xl">
+          <div className="text-xs font-black uppercase text-zinc-500 mb-3">Lunch</div>
+          <div className="space-y-2">
+            <div className="flex justify-between">
+              <div className="text-white">Chicken Breast</div>
+              <div className="text-zinc-500 text-sm">300 cal</div>
+            </div>
+            <div className="flex justify-between">
+              <div className="text-white">Brown Rice</div>
+              <div className="text-zinc-500 text-sm">210 cal</div>
+            </div>
+          </div>
+        </div>
+
+        <div className="bg-[#16161A] border border-zinc-800 p-4 rounded-2xl">
+          <div className="text-xs font-black uppercase text-zinc-500 mb-3">Dinner</div>
+          <div className="space-y-2">
+            <div className="flex justify-between">
+              <div className="text-white">Salmon Filet</div>
+              <div className="text-zinc-500 text-sm">400 cal</div>
+            </div>
+            <div className="flex justify-between">
+              <div className="text-white">Steamed Broccoli</div>
+              <div className="text-zinc-500 text-sm">50 cal</div>
+            </div>
+          </div>
+        </div>
+        
+        <div className="bg-[#16161A] border border-zinc-800 p-4 rounded-2xl">
+          <div className="text-xs font-black uppercase text-zinc-500 mb-3">Shopping List</div>
+          <div className="space-y-2">
+            <div className="flex justify-between">
+              <div className="text-white">Chicken Breast</div>
+              <div className="text-zinc-500 text-sm">1.5 kg</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div className="absolute inset-0 flex items-center justify-center z-10 px-6 mt-16">
+        <div className="bg-[#1D1D22] border border-zinc-800 p-6 rounded-2xl w-full text-center shadow-2xl">
+          <div className="w-12 h-12 mx-auto bg-[#3478F7]/20 rounded-xl flex items-center justify-center text-[#3478F7] mb-4">
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect>
+              <path d="M7 11V7a5 5 0 0 1 10 0v4"></path>
+            </svg>
+          </div>
+          <h2 className="text-xl font-bold text-white mb-2">Unlock with Dead Lock Pro</h2>
+          <p className="text-zinc-400 text-sm mb-6">
+            Get personalized 7-day diet plans, HD video workouts, shopping lists, and meal macro targets
+          </p>
+          <button 
+            onClick={onOpenPaywall}
+            className="w-full bg-[#3478F7] text-white font-bold py-3 rounded-xl tap-spring"
+          >
+            Upgrade to Pro
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ==========================================
+// DIET PLAN TAB
+// ==========================================
+function DietPlanTab({ profile, foodLogs, onSaveFood, userKeys }) {
+  const [dietPrefs, setDietPrefs] = useState(null);
+  const [dietPlan, setDietPlan] = useState(null);
+  const [selectedDay, setSelectedDay] = useState(0); // 0=Mon, 6=Sun
+  const [showSetup, setShowSetup] = useState(false);
+  const [showShoppingList, setShowShoppingList] = useState(false);
+  const [isGenerating, setIsGenerating] = useState(false);
+
+  // Setup form state
+  const [formDietType, setFormDietType] = useState('vegetarian');
+  const [formCuisine, setFormCuisine] = useState('mixed');
+  const [formMealsPerDay, setFormMealsPerDay] = useState(4);
+  const [formAvoidList, setFormAvoidList] = useState('');
+
+  useEffect(() => {
+    try {
+      const prefs = localStorage.getItem(userKeys.DIET_PREFERENCES);
+      if (prefs) {
+        const parsedPrefs = JSON.parse(prefs);
+        setDietPrefs(parsedPrefs);
+        setFormDietType(parsedPrefs.dietType || 'vegetarian');
+        setFormCuisine(parsedPrefs.cuisine || 'mixed');
+        setFormMealsPerDay(parsedPrefs.mealsPerDay || 4);
+        setFormAvoidList(parsedPrefs.avoidList || '');
+      } else {
+        setShowSetup(true);
+      }
+      
+      const plan = localStorage.getItem(userKeys.DIET_PLAN);
+      if (plan) {
+        setDietPlan(JSON.parse(plan));
+      } else {
+        setShowSetup(true);
+      }
+    } catch (e) {
+      setShowSetup(true);
+    }
+  }, [userKeys]);
+
+  const generateDietPlan = (prefs) => {
+    const macros = calculateMacros(profile);
+    const { dietType, mealsPerDay, avoidList } = prefs;
+    const avoids = avoidList.toLowerCase().split(',').map(s => s.trim()).filter(s => s);
+    
+    // Filter DB
+    let availableFoods = NUTRITION_DATABASE.filter(f => {
+      if (avoids.some(a => f.name.toLowerCase().includes(a))) return false;
+      if (dietType === 'vegetarian') return f.dietType === 'veg' || f.dietType === 'vegan';
+      if (dietType === 'eggetarian') return f.dietType === 'veg' || f.dietType === 'vegan' || f.dietType === 'egg';
+      if (dietType === 'vegan') return f.dietType === 'vegan';
+      return true; // non-veg
+    });
+
+    const days = [];
+    const mealFractions = mealsPerDay === 3 ? [0.3, 0.4, 0.3] : 
+                          mealsPerDay === 4 ? [0.25, 0.3, 0.15, 0.3] : 
+                          mealsPerDay === 5 ? [0.2, 0.25, 0.15, 0.25, 0.15] :
+                          [0.2, 0.2, 0.15, 0.15, 0.2, 0.1];
+    
+    const mealNames = mealsPerDay === 3 ? ['Breakfast', 'Lunch', 'Dinner'] : 
+                      mealsPerDay === 4 ? ['Breakfast', 'Lunch', 'Snack', 'Dinner'] : 
+                      mealsPerDay === 5 ? ['Breakfast', 'Lunch', 'Snack', 'Dinner', 'Evening Snack'] :
+                      ['Pre-Workout', 'Breakfast', 'Lunch', 'Snack', 'Dinner', 'Evening Snack'];
+
+    for (let d = 0; d < 7; d++) {
+      let dayMeals = [];
+      let currentSeed = Date.now() + d;
+      const pseudoRandom = () => {
+        currentSeed = (currentSeed * 9301 + 49297) % 233280;
+        return currentSeed / 233280;
+      };
+
+      for (let m = 0; m < mealsPerDay; m++) {
+        let mealItems = [];
+        const isSnack = mealNames[m].toLowerCase().includes('snack') || mealNames[m].toLowerCase().includes('pre-workout');
+        
+        let catsToPick = isSnack ? ['fruit', 'protein', 'dairy'] : ['grain', 'protein', 'vegetable'];
+        
+        catsToPick.forEach(cat => {
+          let catFoods = availableFoods.filter(f => f.category === cat);
+          if (catFoods.length > 0) {
+            let item = catFoods[Math.floor(pseudoRandom() * catFoods.length)];
+            mealItems.push({...item});
+          }
+        });
+
+        if (!isSnack && mealItems.length > 0) {
+            let extraCats = ['fat', 'legume'];
+            let exCat = extraCats[Math.floor(pseudoRandom() * extraCats.length)];
+            let catFoods = availableFoods.filter(f => f.category === exCat);
+            if(catFoods.length > 0){
+                mealItems.push({...catFoods[Math.floor(pseudoRandom() * catFoods.length)]});
+            }
+        }
+
+        let mealTotals = mealItems.reduce((acc, item) => {
+            acc.cal += item.cal;
+            acc.p += item.p;
+            acc.c += item.c;
+            acc.f += item.f;
+            return acc;
+        }, {cal: 0, p: 0, c: 0, f: 0});
+
+        dayMeals.push({
+          name: mealNames[m],
+          items: mealItems,
+          totals: mealTotals
+        });
+      }
+      
+      let dayTotals = dayMeals.reduce((acc, meal) => {
+        acc.cal += meal.totals.cal;
+        acc.p += meal.totals.p;
+        acc.c += meal.totals.c;
+        acc.f += meal.totals.f;
+        return acc;
+      }, {cal: 0, p: 0, c: 0, f: 0});
+
+      days.push({ meals: dayMeals, totals: dayTotals });
+    }
+    
+    return { days, generatedAt: Date.now() };
+  };
+
+  const handleGenerate = () => {
+    setIsGenerating(true);
+    setTimeout(() => {
+      const prefs = {
+        dietType: formDietType,
+        cuisine: formCuisine,
+        mealsPerDay: formMealsPerDay,
+        avoidList: formAvoidList
+      };
+      setDietPrefs(prefs);
+      localStorage.setItem(userKeys.DIET_PREFERENCES, JSON.stringify(prefs));
+      
+      const plan = generateDietPlan(prefs);
+      setDietPlan(plan);
+      localStorage.setItem(userKeys.DIET_PLAN, JSON.stringify(plan));
+      
+      setShowSetup(false);
+      setIsGenerating(false);
+    }, 800);
+  };
+
+  const regenerateDay = (dayIndex) => {
+    if(!dietPlan) return;
+    setIsGenerating(true);
+    setTimeout(() => {
+      const oneDayPlan = generateDietPlan(dietPrefs).days[0];
+      const newPlan = {...dietPlan};
+      newPlan.days[dayIndex] = oneDayPlan;
+      setDietPlan(newPlan);
+      localStorage.setItem(userKeys.DIET_PLAN, JSON.stringify(newPlan));
+      setIsGenerating(false);
+    }, 500);
+  };
+
+  const swapItem = (dayIdx, mealIdx, itemIdx) => {
+    if(!dietPlan || !dietPrefs) return;
+    const newPlan = {...dietPlan};
+    const meal = newPlan.days[dayIdx].meals[mealIdx];
+    const itemToSwap = meal.items[itemIdx];
+    
+    const { dietType, avoidList } = dietPrefs;
+    const avoids = avoidList.toLowerCase().split(',').map(s => s.trim()).filter(s => s);
+    
+    const availableFoods = NUTRITION_DATABASE.filter(f => {
+      if (f.category !== itemToSwap.category) return false;
+      if (f.name === itemToSwap.name) return false;
+      if (avoids.some(a => f.name.toLowerCase().includes(a))) return false;
+      if (dietType === 'vegetarian') return f.dietType === 'veg' || f.dietType === 'vegan';
+      if (dietType === 'eggetarian') return f.dietType === 'veg' || f.dietType === 'vegan' || f.dietType === 'egg';
+      if (dietType === 'vegan') return f.dietType === 'vegan';
+      return true;
+    });
+
+    if(availableFoods.length > 0) {
+      const newItem = availableFoods[Math.floor(Math.random() * availableFoods.length)];
+      meal.items[itemIdx] = {...newItem};
+      
+      meal.totals = meal.items.reduce((acc, item) => {
+          acc.cal += item.cal;
+          acc.p += item.p;
+          acc.c += item.c;
+          acc.f += item.f;
+          return acc;
+      }, {cal: 0, p: 0, c: 0, f: 0});
+      
+      newPlan.days[dayIdx].totals = newPlan.days[dayIdx].meals.reduce((acc, m) => {
+        acc.cal += m.totals.cal;
+        acc.p += m.totals.p;
+        acc.c += m.totals.c;
+        acc.f += m.totals.f;
+        return acc;
+      }, {cal: 0, p: 0, c: 0, f: 0});
+
+      setDietPlan(newPlan);
+      localStorage.setItem(userKeys.DIET_PLAN, JSON.stringify(newPlan));
+    }
+  };
+
+  const logMeal = (meal) => {
+    const todayStr = new Date().toISOString().slice(0, 10);
+    meal.items.forEach((item, i) => {
+      onSaveFood({
+        id: 'food_' + Date.now() + '_' + i,
+        date: todayStr,
+        timestamp: Date.now(),
+        name: item.name,
+        calories: item.cal,
+        protein: item.p,
+        carbs: item.c,
+        fat: item.f,
+        confidence: 'high',
+        source: 'plan'
+      });
+    });
+  };
+
+  const copyShoppingList = (text) => {
+    if (navigator.clipboard) {
+      navigator.clipboard.writeText(text).then(() => {});
+    }
+  };
+  
+  const shareShoppingList = (text) => {
+    if (navigator.share) {
+      navigator.share({ title: 'Dead Lock Shopping List', text }).catch(() => {});
+    }
+  };
+
+  if (showSetup) {
+    return (
+      <div className="pb-28 max-w-md mx-auto px-5 pt-4">
+        <h1 className="text-3xl font-display text-white uppercase tracking-tight mb-6">Diet Plan Setup</h1>
+        
+        <div className="space-y-6">
+          <div>
+            <label className="block text-sm font-bold text-zinc-400 uppercase mb-3">Dietary Preference</label>
+            <div className="grid grid-cols-2 gap-3">
+              {['Vegetarian', 'Eggetarian', 'Non-Vegetarian', 'Vegan'].map(type => {
+                const val = type.toLowerCase().replace('-', '');
+                const isSel = formDietType === val;
+                return (
+                  <div 
+                    key={val}
+                    onClick={() => setFormDietType(val)}
+                    className={`p-4 rounded-xl border-2 text-center cursor-pointer tap-spring ${isSel ? 'border-[#3478F7] bg-[#3478F7]/10 text-white' : 'border-zinc-800 bg-[#16161A] text-zinc-400'}`}
+                  >
+                    <span className="font-bold">{type}</span>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+
+          <div>
+            <label className="block text-sm font-bold text-zinc-400 uppercase mb-3">Cuisine Leaning</label>
+            <div className="flex space-x-3">
+              {['Indian', 'Western', 'Mixed'].map(type => {
+                const val = type.toLowerCase();
+                const isSel = formCuisine === val;
+                return (
+                  <button 
+                    key={val}
+                    onClick={() => setFormCuisine(val)}
+                    className={`flex-1 py-3 rounded-xl border-2 font-bold tap-spring ${isSel ? 'border-[#3478F7] bg-[#3478F7]/10 text-white' : 'border-zinc-800 bg-[#16161A] text-zinc-400'}`}
+                  >
+                    {type}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+
+          <div>
+            <label className="block text-sm font-bold text-zinc-400 uppercase mb-3">Meals Per Day</label>
+            <div className="flex space-x-3">
+              {[3, 4, 5, 6].map(num => (
+                <button 
+                  key={num}
+                  onClick={() => setFormMealsPerDay(num)}
+                  className={`flex-1 py-3 rounded-xl border-2 font-bold tap-spring ${formMealsPerDay === num ? 'border-[#3478F7] bg-[#3478F7]/10 text-white' : 'border-zinc-800 bg-[#16161A] text-zinc-400'}`}
+                >
+                  {num}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div>
+            <label className="block text-sm font-bold text-zinc-400 uppercase mb-3">Avoid List (Optional)</label>
+            <textarea 
+              value={formAvoidList}
+              onChange={(e) => setFormAvoidList(e.target.value)}
+              placeholder="e.g. mushrooms, seafood, soy"
+              className="w-full bg-[#16161A] border-2 border-zinc-800 rounded-xl p-4 text-white focus:outline-none focus:border-zinc-600 h-24 resize-none"
+            />
+          </div>
+
+          <button 
+            onClick={handleGenerate}
+            disabled={isGenerating}
+            className="w-full bg-[#3478F7] text-white font-bold py-4 rounded-xl tap-spring mt-4"
+          >
+            {isGenerating ? 'Generating...' : 'Generate My 7-Day Plan'}
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  if (!dietPlan) return null;
+
+  const targets = calculateMacros(profile);
+  const dayLabels = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+
+  if (showShoppingList) {
+    const list = {};
+    dietPlan.days.forEach(day => {
+      day.meals.forEach(meal => {
+        meal.items.forEach(item => {
+          let cat = item.category || 'misc';
+          if (cat === 'grain' || cat === 'carb') cat = 'Grains & Carbs';
+          else if (cat === 'protein') cat = 'Proteins';
+          else if (cat === 'vegetable' || cat === 'fruit') cat = 'Vegetables & Fruits';
+          else if (cat === 'dairy') cat = 'Dairy';
+          else if (cat === 'fat') cat = 'Fats & Oils';
+          else if (cat === 'legume') cat = 'Legumes & Pulses';
+          
+          if (!list[cat]) list[cat] = {};
+          if (!list[cat][item.name]) list[cat][item.name] = { count: 0, unit: item.unit };
+          list[cat][item.name].count += 1;
+        });
+      });
+    });
+
+    let shareText = "My Dead Lock Shopping List:\n\n";
+    Object.keys(list).sort().forEach(cat => {
+      shareText += `${cat.toUpperCase()}:\n`;
+      Object.keys(list[cat]).forEach(itemName => {
+        shareText += `- ${itemName} (${list[cat][itemName].count}x ${list[cat][itemName].unit})\n`;
+      });
+      shareText += "\n";
+    });
+
+    return (
+      <div className="pb-28 max-w-md mx-auto px-5 pt-4">
+        <h1 className="text-3xl font-display text-white uppercase tracking-tight mb-4">Diet Planner</h1>
+        
+        <div className="flex space-x-2 mb-6 bg-[#101014] p-1 rounded-xl">
+          <button onClick={() => setShowShoppingList(false)} className="flex-1 py-2 text-sm font-bold text-zinc-400 rounded-lg">Meal Plan</button>
+          <button className="flex-1 py-2 text-sm font-bold bg-[#1D1D22] text-white shadow rounded-lg">Shopping List</button>
+        </div>
+
+        <div className="flex space-x-3 mb-6">
+          <button onClick={() => copyShoppingList(shareText)} className="flex-1 bg-[#16161A] border border-zinc-800 text-white py-3 rounded-xl text-sm font-bold flex justify-center items-center space-x-2">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg> <span>Copy</span>
+          </button>
+          <button onClick={() => shareShoppingList(shareText)} className="flex-1 bg-[#3478F7] text-white py-3 rounded-xl text-sm font-bold flex justify-center items-center space-x-2">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="18" cy="5" r="3"></circle><circle cx="6" cy="12" r="3"></circle><circle cx="18" cy="19" r="3"></circle><line x1="8.59" y1="13.51" x2="15.42" y2="17.49"></line><line x1="15.41" y1="6.51" x2="8.59" y2="10.49"></line></svg> <span>Share</span>
+          </button>
+        </div>
+
+        <div className="space-y-6">
+          {Object.keys(list).sort().map(cat => (
+            <div key={cat}>
+              <h3 className="text-[#3478F7] font-bold text-sm uppercase mb-3 tracking-wide">{cat}</h3>
+              <div className="bg-[#16161A] border border-zinc-800 rounded-2xl overflow-hidden">
+                {Object.keys(list[cat]).map((itemName, idx) => (
+                  <div key={itemName} className={`p-4 flex justify-between items-center ${idx !== Object.keys(list[cat]).length - 1 ? 'border-b border-zinc-800/50' : ''}`}>
+                    <div className="text-white font-medium">{itemName}</div>
+                    <div className="text-zinc-500 text-sm">{list[cat][itemName].count}x {list[cat][itemName].unit}</div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+    );
+  }
+
+  const currentDayData = dietPlan.days[selectedDay];
+
+  return (
+    <div className="pb-28 max-w-md mx-auto px-5 pt-4">
+      <h1 className="text-3xl font-display text-white uppercase tracking-tight mb-4">Diet Planner</h1>
+      
+      <div className="flex space-x-2 mb-6 bg-[#101014] p-1 rounded-xl">
+        <button className="flex-1 py-2 text-sm font-bold bg-[#1D1D22] text-white shadow rounded-lg">Meal Plan</button>
+        <button onClick={() => setShowShoppingList(true)} className="flex-1 py-2 text-sm font-bold text-zinc-400 rounded-lg">Shopping List</button>
+      </div>
+
+      <div className="flex space-x-2 overflow-x-auto pb-2 mb-6 scrollbar-hide">
+        {dayLabels.map((day, idx) => (
+          <button
+            key={day}
+            onClick={() => setSelectedDay(idx)}
+            className={`flex-none w-14 h-16 rounded-2xl flex flex-col items-center justify-center font-bold tap-spring ${selectedDay === idx ? 'bg-[#3478F7] text-white' : 'bg-zinc-900 text-zinc-400 border border-zinc-800'}`}
+          >
+            <span className="text-xs uppercase">{day}</span>
+          </button>
+        ))}
+      </div>
+
+      <div className="bg-[#16161A] border border-zinc-800 rounded-2xl p-4 mb-6">
+        <div className="flex justify-between items-end mb-4">
+          <div>
+            <div className="text-xs font-bold text-zinc-500 uppercase tracking-wide">Day's Total</div>
+            <div className="text-2xl font-black text-white">{Math.round(currentDayData.totals.cal)} <span className="text-base font-medium text-zinc-500">/ {targets.targetCalories} cal</span></div>
+          </div>
+        </div>
+        
+        <div className="grid grid-cols-3 gap-4">
+          <div>
+            <div className="flex justify-between text-xs mb-1"><span className="text-zinc-400">Protein</span><span className="text-white font-bold">{Math.round(currentDayData.totals.p)}g</span></div>
+            <div className="h-1.5 bg-zinc-800 rounded-full overflow-hidden"><div className="h-full bg-[#3478F7]" style={{width: `${Math.min(100, (currentDayData.totals.p/targets.protein)*100)}%`}}></div></div>
+          </div>
+          <div>
+            <div className="flex justify-between text-xs mb-1"><span className="text-zinc-400">Carbs</span><span className="text-white font-bold">{Math.round(currentDayData.totals.c)}g</span></div>
+            <div className="h-1.5 bg-zinc-800 rounded-full overflow-hidden"><div className="h-full bg-[#EC562E]" style={{width: `${Math.min(100, (currentDayData.totals.c/targets.carbs)*100)}%`}}></div></div>
+          </div>
+          <div>
+            <div className="flex justify-between text-xs mb-1"><span className="text-zinc-400">Fat</span><span className="text-white font-bold">{Math.round(currentDayData.totals.f)}g</span></div>
+            <div className="h-1.5 bg-zinc-800 rounded-full overflow-hidden"><div className="h-full bg-[#F3D2C6]" style={{width: `${Math.min(100, (currentDayData.totals.f/targets.fat)*100)}%`}}></div></div>
+          </div>
+        </div>
+      </div>
+
+      <div className="space-y-4 mb-8">
+        {currentDayData.meals.map((meal, mIdx) => (
+          <div key={mIdx} className="bg-[#101014] border border-zinc-800 rounded-2xl p-4">
+            <div className="flex justify-between items-center mb-3">
+              <div className="text-xs font-black uppercase text-zinc-500">{meal.name}</div>
+              <div className="text-sm font-bold text-white">{Math.round(meal.totals.cal)} cal</div>
+            </div>
+            
+            <div className="space-y-3 mb-4">
+              {meal.items.map((item, iIdx) => (
+                <div key={iIdx} className="flex justify-between items-center">
+                  <div className="flex-1">
+                    <div className="text-white font-medium">{item.name}</div>
+                    <div className="text-xs text-zinc-500">{item.unit} • {item.cal} cal • {item.p}p • {item.c}c • {item.f}f</div>
+                  </div>
+                  <button onClick={() => swapItem(selectedDay, mIdx, iIdx)} className="text-xs text-[#3478F7] font-bold p-2 tap-spring">Swap</button>
+                </div>
+              ))}
+            </div>
+            
+            <button 
+              onClick={() => logMeal(meal)}
+              className="w-full py-2.5 rounded-lg border border-zinc-700 text-sm font-bold text-white flex items-center justify-center space-x-2 tap-spring"
+            >
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg> <span>Log this meal</span>
+            </button>
+          </div>
+        ))}
+      </div>
+
+      <button 
+        onClick={() => regenerateDay(selectedDay)}
+        disabled={isGenerating}
+        className="w-full bg-[#16161A] border border-zinc-800 text-white font-bold py-4 rounded-xl tap-spring mb-4 flex items-center justify-center space-x-2"
+      >
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="23 4 23 10 17 10"></polyline><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"></path></svg> <span>{isGenerating ? 'Regenerating...' : 'Regenerate This Day'}</span>
+      </button>
+
+      <div className="text-center">
+        <button onClick={() => setShowSetup(true)} className="text-sm text-zinc-500 underline tap-spring">Edit Preferences</button>
+      </div>
+    </div>
+  );
+}
+
+// ==========================================
 // 17. FROSTED BLUR BOTTOM NAVIGATION DOCK
 // ==========================================
 function BottomNavDock({ currentTab, onTabChange }) {
   const tabs = [
     { id: 'dashboard', label: 'Dashboard', icon: Icons.Dashboard },
     { id: 'workout', label: 'Workout', icon: Icons.Workout },
+    { id: 'diet', label: 'Diet', icon: Icons.Diet },
     { id: 'food', label: 'Food', icon: Icons.Food },
     { id: 'profile', label: 'Profile', icon: Icons.Profile }
   ];
@@ -3489,10 +4981,20 @@ function App() {
   const [activeSession, setActiveSession] = useState(null);
   const [shuffleOffsets, setShuffleOffsets] = useState({});
 
+  // Pro entitlement, consumable scan credits & Paywall states
+  const [isPro, setIsPro] = useState(() => {
+    try {
+      return localStorage.getItem(userKeys.IS_PRO) === 'true';
+    } catch (e) {
+      return false;
+    }
+  });
+  const [scanCredits, setScanCredits] = useState(() => getScanCredits(userKeys));
+  const [showPaywall, setShowPaywall] = useState(false);
+
   // Confirmation modals state
   const [showSignOutConfirm, setShowSignOutConfirm] = useState(false);
   const [showResetConfirm, setShowResetConfirm] = useState(false);
-
 
   // Thank You / Completion modal
   const [thankYouModal, setThankYouModal] = useState(null);
@@ -3502,6 +5004,7 @@ function App() {
     const titles = {
       dashboard: 'Dead Lock — Athlete Command Center',
       workout: 'Dead Lock — 6-Day Workout Engine',
+      diet: 'Dead Lock — Custom Diet Planner',
       food: 'Dead Lock — Macro & Nutrition Tracker',
       profile: 'Dead Lock — Athlete Profile & Settings'
     };
@@ -3519,6 +5022,8 @@ function App() {
       setWeightLogs([]);
       setApiKey('');
       setHasOnboarded(false);
+      setIsPro(false);
+      setScanCredits(0);
       return;
     }
 
@@ -3554,6 +5059,19 @@ function App() {
       const k = localStorage.getItem(keys.API_KEY);
       setApiKey(k || '');
     } catch (e) { setApiKey(''); }
+
+    try {
+      const cachedPro = localStorage.getItem(keys.IS_PRO) === 'true';
+      setIsPro(cachedPro);
+      setScanCredits(getScanCredits(keys));
+    } catch (e) {}
+
+    // Verify against platform on launch / identity switch, don't trust cache forever
+    verifyProEntitlement(keys).then((res) => {
+      if (res && typeof res.isPro === 'boolean') {
+        setIsPro(res.isPro);
+      }
+    });
 
     try {
       const ob = localStorage.getItem(keys.HAS_ONBOARDED) === 'true';
@@ -3684,6 +5202,9 @@ function App() {
     setShowIntro(false);
     setShowOnboarding(false);
     setActiveSession(null);
+    setIsPro(false);
+    setScanCredits(0);
+    setShowPaywall(false);
   };
 
   const workoutPlan = useMemo(() => {
@@ -3943,6 +5464,9 @@ function App() {
         profile={profile}
         onSaveWorkout={handleSaveWorkout}
         onExit={() => setActiveSession(null)}
+        isPro={isPro}
+        userKeys={userKeys}
+        onOpenPaywall={() => setShowPaywall(true)}
       />
     );
   }
@@ -3975,6 +5499,21 @@ function App() {
         />
       )}
 
+      {currentTab === 'diet' && (
+        isPro ? (
+          <DietPlanTab
+            profile={profile}
+            foodLogs={foodLogs}
+            onSaveFood={handleSaveFood}
+            userKeys={userKeys}
+          />
+        ) : (
+          <DietLockedPreview
+            onOpenPaywall={() => setShowPaywall(true)}
+          />
+        )
+      )}
+
       {currentTab === 'food' && (
         <FoodTab
           foodLogs={foodLogs}
@@ -3983,6 +5522,11 @@ function App() {
           onSaveFood={handleSaveFood}
           onDeleteFood={handleDeleteFood}
           onOpenSettings={() => setCurrentTab('profile')}
+          isPro={isPro}
+          scanCredits={scanCredits}
+          userKeys={userKeys}
+          onOpenPaywall={() => setShowPaywall(true)}
+          onUseCredit={() => setScanCredits(getScanCredits(userKeys))}
         />
       )}
 
@@ -3992,6 +5536,8 @@ function App() {
           equipment={equipment}
           apiKey={apiKey}
           authUser={authUser}
+          isPro={isPro}
+          onOpenPaywall={() => setShowPaywall(true)}
           onGoogleSignIn={handleGoogleSignIn}
           onSignOut={() => setShowSignOutConfirm(true)}
           onTriggerGoogleSignIn={() => {
@@ -4052,6 +5598,24 @@ function App() {
           details={thankYouModal.details}
           ctaText={thankYouModal.ctaText}
           onClose={() => setThankYouModal(null)}
+        />
+      )}
+
+      {/* Paywall Screen Modal */}
+      {showPaywall && (
+        <PaywallScreen
+          isOpen={showPaywall}
+          onClose={() => setShowPaywall(false)}
+          onPurchaseSuccess={() => {
+            verifyProEntitlement(userKeys).then((res) => {
+              if (res && typeof res.isPro === 'boolean') setIsPro(res.isPro);
+            });
+            setScanCredits(getScanCredits(userKeys));
+            setShowPaywall(false);
+          }}
+          isPro={isPro}
+          scanCredits={scanCredits}
+          userKeys={userKeys}
         />
       )}
 

@@ -25,6 +25,7 @@ function loadEnv() {
 loadEnv();
 
 const PORT = process.env.PORT || 3000;
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
 
 // OAuth Validation Configuration
 const GOOGLE_IOS_CLIENT_ID = process.env.GOOGLE_IOS_CLIENT_ID || '646212023629-urciv20i6p3sas908ff5le4bsfcft8hm.apps.googleusercontent.com';
@@ -108,6 +109,47 @@ function verifyGoogleIdToken(idToken) {
   });
 }
 
+// Call Gemini API securely from backend
+async function callGeminiApiBackend(promptText, inlineData = null) {
+  if (!GEMINI_API_KEY) {
+    throw new Error('Server AI key (GEMINI_API_KEY) is not configured.');
+  }
+  const models = ['gemini-2.5-flash', 'gemini-1.5-flash', 'gemini-flash-latest'];
+  let parts = [{ text: promptText }];
+  if (inlineData) {
+    parts.push({ inlineData });
+  }
+
+  let lastErr = null;
+  for (const model of models) {
+    try {
+      const resp = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${GEMINI_API_KEY}`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            contents: [{ parts }],
+            generationConfig: { temperature: 0.1, responseMimeType: 'application/json' }
+          })
+        }
+      );
+      if (resp.ok) {
+        const data = await resp.json();
+        const rawText = data?.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
+        const cleanJson = rawText.replace(/```json/g, '').replace(/```/g, '').trim();
+        return JSON.parse(cleanJson);
+      } else {
+        const errObj = await resp.json().catch(() => ({}));
+        lastErr = new Error(errObj?.error?.message || `HTTP ${resp.status}`);
+      }
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  throw lastErr || new Error('Gemini API call failed');
+}
+
 // Apply baseline HTTP security headers
 function applySecurityHeaders(res) {
   res.setHeader('X-Content-Type-Options', 'nosniff');
@@ -157,6 +199,7 @@ const server = http.createServer((req, res) => {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
       status: 'ok',
+      hasAiService: Boolean(GEMINI_API_KEY),
       google: {
         projectId: GOOGLE_PROJECT_ID,
         iosClientId: GOOGLE_IOS_CLIENT_ID
@@ -253,6 +296,78 @@ const server = http.createServer((req, res) => {
       } catch (err) {
         res.writeHead(401, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ valid: false, error: 'Token validation error' }));
+      }
+    });
+    return;
+  }
+
+  // API ROUTE: Server-side AI Food & Photo Macro Analysis
+  if (reqPath === '/api/ai/analyze-food' && req.method === 'POST') {
+    if (!checkRateLimit(`ai_${clientIp}`, 30, 60000)) {
+      res.writeHead(429, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: 'Too many AI requests. Please slow down.' }));
+      return;
+    }
+
+    if (!GEMINI_API_KEY) {
+      res.writeHead(503, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        ok: false,
+        error: 'AI service is not configured on this server. Add GEMINI_API_KEY in .env file.'
+      }));
+      return;
+    }
+
+    let body = '';
+    let bodySize = 0;
+    let tooLarge = false;
+    const MAX_AI_BODY_SIZE = 10 * 1024 * 1024; // 10MB to accommodate base64 photos
+
+    req.on('error', () => {});
+    req.on('data', chunk => {
+      if (tooLarge) return;
+      bodySize += chunk.length;
+      if (bodySize > MAX_AI_BODY_SIZE) {
+        tooLarge = true;
+        res.writeHead(413, { 'Content-Type': 'application/json', 'Connection': 'close' });
+        res.end(JSON.stringify({ ok: false, error: 'Payload too large (10MB max)' }));
+        req.resume();
+        return;
+      }
+      body += chunk;
+    });
+
+    req.on('end', async () => {
+      if (tooLarge) return;
+      try {
+        let payload;
+        try {
+          payload = JSON.parse(body || '{}');
+        } catch (e) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'Malformed JSON payload' }));
+          return;
+        }
+
+        const { promptText, inlineData } = payload;
+        if (!promptText || typeof promptText !== 'string' || promptText.length > 5000) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'Missing or invalid promptText' }));
+          return;
+        }
+
+        if (inlineData && (!inlineData.mimeType || !inlineData.data || typeof inlineData.data !== 'string')) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'Invalid inlineData format' }));
+          return;
+        }
+
+        const result = await callGeminiApiBackend(promptText, inlineData);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, data: result }));
+      } catch (err) {
+        res.writeHead(502, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: err.message || 'AI request failed' }));
       }
     });
     return;
